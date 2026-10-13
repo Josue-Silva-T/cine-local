@@ -9,6 +9,10 @@
     series/      una carpeta por serie     ->  ABREV_Nombre de la serie/  con T1C4_lucha.mkv (temporada 1, capítulo 4, "lucha")
     caratulas/   imágenes 2:3 vertical     ->  ABREV.jpg
 
+  Eliminar perfiles pide la contraseña "claveAdmin" de config.json.
+  Perfiles, historial, calificaciones y reseñas se guardan en data/db.json
+  (las fotos de perfil en data/avatars/). Respalda esa carpeta para no perderlos.
+
   Uso:  node server.js            (solo este equipo)
         node server.js --lan      (también otros dispositivos de tu red)
 */
@@ -28,7 +32,7 @@ const NO_OPEN = process.argv.includes('--no-open');
 const VIDEO = /\.(mp4|m4v|webm|mov|mkv|ogv|avi)$/i;
 const IMAGE = /\.(jpe?g|png|webp)$/i;
 const KINDS = ['peliculas', 'series', 'caratulas'];
-const DEFAULTS = { puerto: 3000, peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
+const DEFAULTS = { puerto: 3000, claveAdmin: 'admin', peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -66,7 +70,10 @@ function loadConfig() {
     try { user = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
     catch (e) { error = 'config.json tiene un error de formato (' + e.message + '). Se usan las rutas por defecto.'; }
   }
-  const cfg = { puerto: Number(user.puerto) || DEFAULTS.puerto };
+  const cfg = {
+    puerto: Number(user.puerto) || DEFAULTS.puerto,
+    claveAdmin: typeof user.claveAdmin === 'string' ? user.claveAdmin : DEFAULTS.claveAdmin
+  };
   for (const k of KINDS) {
     const v = user[k];
     const list = (Array.isArray(v) ? v : v ? [v] : []).filter(x => typeof x === 'string' && x.trim());
@@ -338,12 +345,224 @@ const json = (res, code, body) => {
   res.end(JSON.stringify(body));
 };
 
+/* ---------- Perfiles, historial y reseñas (data/db.json) ---------- */
+const DATA_DIR = path.join(ROOT, 'data');
+const AVATAR_DIR = path.join(DATA_DIR, 'avatars');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+let db = { profiles: [], history: {}, ratings: {} };
+let saveTimer = null;
+
+function loadDb() {
+  fs.mkdirSync(AVATAR_DIR, { recursive: true });
+  if (!fs.existsSync(DB_FILE)) return;
+  try {
+    const d = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    db = { profiles: d.profiles || [], history: d.history || {}, ratings: d.ratings || {} };
+  } catch (e) {
+    const bak = DB_FILE + '.corrupto-' + Date.now();
+    fs.renameSync(DB_FILE, bak);
+    console.error(`  Aviso: data/db.json estaba dañado. Se guardó una copia en ${path.basename(bak)} y se empieza de cero.`);
+  }
+}
+function saveNow() {
+  clearTimeout(saveTimer); saveTimer = null;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DB_FILE + '.tmp', JSON.stringify(db));
+    fs.renameSync(DB_FILE + '.tmp', DB_FILE);
+  } catch (e) { console.error('No se pudo guardar data/db.json:', e.message); }
+}
+const scheduleSave = () => { if (!saveTimer) saveTimer = setTimeout(saveNow, 400); };
+['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => { saveNow(); process.exit(0); }));
+
+const publicProfile = p => ({ id: p.id, name: p.name, avatar: p.avatar ? `/avatars/${p.avatar}` : null });
+const findProfile = id => db.profiles.find(p => p.id === id);
+const num = (v, max = 1e9) => Math.min(Math.max(Number(v) || 0, 0), max);
+
+const cleanName = v => String(v || '').replace(/[\u0000-\u001f]/g, '').trim().slice(0, 24);
+const nameTaken = (name, exceptId) => db.profiles.some(x => x.id !== exceptId && x.name.toLowerCase() === name.toLowerCase());
+const adminFails = new Map();
+const safeEqual = (a, b) => {
+  const h = v => crypto.createHash('sha256').update(v).digest();
+  return crypto.timingSafeEqual(h(a), h(b));
+};
+
+function removeAvatar(prof) {
+  if (prof.avatar) fs.unlink(path.join(AVATAR_DIR, prof.avatar), () => {});
+  prof.avatar = null;
+}
+
+// Guarda la foto (data URL). Devuelve null si todo salió bien o [código, mensaje].
+function storeAvatar(prof, dataUrl) {
+  const mm = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl));
+  if (!mm) return [400, 'La foto no es válida'];
+  const buf = Buffer.from(mm[2], 'base64');
+  if (buf.length > 1.5e6) return [413, 'La foto es demasiado grande'];
+  const file = `${prof.id}-${Date.now().toString(36)}.${mm[1] === 'jpeg' ? 'jpg' : mm[1]}`;
+  fs.mkdirSync(AVATAR_DIR, { recursive: true });
+  fs.writeFileSync(path.join(AVATAR_DIR, file), buf);
+  removeAvatar(prof);
+  prof.avatar = file;
+  return null;
+}
+
+function readBody(req, limit = 3e6) {
+  return new Promise((resolve, reject) => {
+    let size = 0; const chunks = [];
+    req.on('data', c => {
+      size += c.length;
+      if (size > limit) { reject(Object.assign(new Error('Contenido demasiado grande'), { status: 413 })); req.destroy(); }
+      else chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch { reject(Object.assign(new Error('JSON no válido'), { status: 400 })); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// Devuelve true si la ruta era de la API de perfiles.
+async function profileApi(req, res, p, url) {
+  const m = req.method;
+  const fail = (code, msg) => { json(res, code, { error: msg }); return true; };
+  const ok = (body, code = 200) => { json(res, code, body); return true; };
+
+  if (p === '/api/profiles' && m === 'GET') return ok(db.profiles.map(publicProfile));
+
+  if (p === '/api/profiles' && m === 'POST') {
+    const b = await readBody(req, 2.5e6);
+    const name = cleanName(b.name);
+    if (!name) return fail(400, 'Escribe un nombre de usuario');
+    if (nameTaken(name)) return fail(409, 'Ya existe un perfil con ese nombre');
+    const prof = { id: 'p' + crypto.randomBytes(5).toString('hex'), name, avatar: null, created: Date.now() };
+    if (b.photo) { const err = storeAvatar(prof, b.photo); if (err) return fail(err[0], err[1]); }
+    db.profiles.push(prof);
+    saveNow();
+    return ok(publicProfile(prof), 201);
+  }
+
+  if (p === '/api/profiles/update' && m === 'POST') {
+    const b = await readBody(req, 2.5e6);
+    const prof = findProfile(b.id);
+    if (!prof) return fail(404, 'Perfil no encontrado');
+    const name = cleanName(b.name);
+    if (!name) return fail(400, 'Escribe un nombre de usuario');
+    if (nameTaken(name, prof.id)) return fail(409, 'Ya existe un perfil con ese nombre');
+    if (b.photo) { const err = storeAvatar(prof, b.photo); if (err) return fail(err[0], err[1]); }
+    else if (b.removePhoto) removeAvatar(prof);
+    prof.name = name;
+    saveNow();
+    return ok(publicProfile(prof));
+  }
+
+  if (p === '/api/profiles/delete' && m === 'POST') {
+    const b = await readBody(req, 1e4);
+    const ip = req.socket.remoteAddress || '?';
+    const f = adminFails.get(ip);
+    if (f && f.until > Date.now()) return fail(429, 'Demasiados intentos. Espera un minuto e inténtalo de nuevo.');
+    const admin = loadConfig().cfg.claveAdmin;
+    if (!admin) return fail(400, 'No hay contraseña de administrador. Define "claveAdmin" en config.json.');
+    if (!safeEqual(String(b.password || ''), admin)) {
+      const n = ((f && f.n) || 0) + 1;
+      adminFails.set(ip, n >= 5 ? { n: 0, until: Date.now() + 60000 } : { n, until: 0 });
+      return fail(403, 'Contraseña de administrador incorrecta');
+    }
+    adminFails.delete(ip);
+    const prof = findProfile(b.id);
+    if (!prof) return fail(404, 'Perfil no encontrado');
+    removeAvatar(prof);
+    db.profiles = db.profiles.filter(x => x.id !== prof.id);
+    delete db.history[prof.id];
+    for (const key of Object.keys(db.ratings)) {
+      delete db.ratings[key][prof.id];
+      if (!Object.keys(db.ratings[key]).length) delete db.ratings[key];
+    }
+    saveNow();
+    return ok({ ok: true });
+  }
+
+  if (p === '/api/history' && m === 'GET') {
+    const pid = url.searchParams.get('profile');
+    if (!findProfile(pid)) return fail(404, 'Perfil no encontrado');
+    const ratings = {};
+    for (const [key, byProfile] of Object.entries(db.ratings)) if (byProfile[pid]) ratings[key] = byProfile[pid];
+    return ok({ history: db.history[pid] || {}, ratings });
+  }
+
+  if (p === '/api/history' && m === 'POST') {
+    const b = await readBody(req, 1e5);
+    if (!findProfile(b.profile) || typeof b.key !== 'string' || !b.key || b.key.length > 400) return fail(400, 'Datos no válidos');
+    if (!db.history[b.profile]) db.history[b.profile] = {};
+    const prev = db.history[b.profile][b.key];
+    const rec = { t: num(b.t), d: num(b.d), pct: Math.max(prev ? prev.pct || 0 : 0, Math.round(num(b.pct, 100))), at: Date.now() };
+    db.history[b.profile][b.key] = rec;
+    scheduleSave();
+    return ok({ ok: true, pct: rec.pct });
+  }
+
+  if (p === '/api/summary' && m === 'GET') {
+    const out = {};
+    for (const [key, byProfile] of Object.entries(db.ratings)) {
+      const list = Object.values(byProfile);
+      if (list.length) out[key] = { sum: list.reduce((a, r) => a + r.stars, 0), n: list.length };
+    }
+    return ok(out);
+  }
+
+  if (p === '/api/reviews' && m === 'POST') {
+    const b = await readBody(req, 5e5);
+    const keys = Array.isArray(b.keys) ? b.keys.slice(0, 1000) : [];
+    const out = [];
+    for (const key of keys) {
+      const byProfile = db.ratings[key];
+      if (!byProfile) continue;
+      for (const [pid, r] of Object.entries(byProfile)) {
+        const prof = findProfile(pid);
+        if (!prof) continue;
+        const h = db.history[pid] && db.history[pid][key];
+        out.push({ key, profile: publicProfile(prof), stars: r.stars, review: r.review || '', at: r.at, pct: h ? h.pct || 0 : 0 });
+      }
+    }
+    out.sort((a, b2) => b2.at - a.at);
+    return ok({ reviews: out });
+  }
+
+  if (p === '/api/rating' && m === 'POST') {
+    const b = await readBody(req, 1e5);
+    const stars = Number(b.stars);
+    if (!findProfile(b.profile) || typeof b.key !== 'string' || !b.key || b.key.length > 400) return fail(400, 'Datos no válidos');
+    if (!Number.isInteger(stars) || stars < 1 || stars > 5) return fail(400, 'Elige de 1 a 5 estrellas');
+    const review = String(b.review || '').trim().slice(0, 1000);
+    if (!db.ratings[b.key]) db.ratings[b.key] = {};
+    db.ratings[b.key][b.profile] = { stars, review, at: Date.now() };
+    saveNow();
+    return ok({ ok: true });
+  }
+
+  if (p === '/api/rating/delete' && m === 'POST') {
+    const b = await readBody(req, 1e5);
+    if (db.ratings[b.key]) {
+      delete db.ratings[b.key][b.profile];
+      if (!Object.keys(db.ratings[b.key]).length) delete db.ratings[b.key];
+      saveNow();
+    }
+    return ok({ ok: true });
+  }
+
+  return false;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     const p = decodeURIComponent(url.pathname);
 
     if (p === '/api/library') return json(res, 200, await scan());
+
+    if (p.startsWith('/api/') && await profileApi(req, res, p, url)) return;
+
+    if (/^\/avatars\/p[a-f0-9]+(-[a-z0-9]+)?\.(jpg|png|webp)$/.test(p)) return serveFile(req, res, path.join(AVATAR_DIR, p.slice(9)), true);
 
     if (p === '/api/prepare') {
       const [code, body] = await prepare(url.searchParams.get('kind'), parseInt(url.searchParams.get('root'), 10),
@@ -364,10 +583,11 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(404); res.end('No encontrado');
   } catch (e) {
     console.error('Error en', req.url, '->', e);
-    json(res, 500, { error: e.message || String(e) });
+    if (!res.headersSent) json(res, e.status || 500, { error: e.message || String(e) });
   }
 });
 
+loadDb();
 const PORT = Number(process.env.PORT) || loadConfig().cfg.puerto;
 
 server.on('error', e => {
@@ -388,6 +608,9 @@ server.listen(PORT, LAN ? '0.0.0.0' : '127.0.0.1', () => {
       .filter(i => i && i.family === 'IPv4' && !i.internal)
       .forEach(i => console.log(`  En tu red: http://${i.address}:${PORT}`));
   }
+  console.log(`  Perfiles y reseñas: ${DATA_DIR}`);
+  if (cfg.claveAdmin === 'admin') console.log('  Aviso: la contraseña de administrador sigue siendo "admin". Cámbiala en config.json (claveAdmin).');
+  else if (!cfg.claveAdmin) console.log('  Aviso: sin contraseña de administrador (claveAdmin vacía): no se podrán eliminar perfiles.');
   console.log('\n  Rutas editables en config.json. Ctrl + C para detener.\n');
   if (!NO_OPEN) {
     const cmd = process.platform === 'darwin' ? `open "${local}"` : `xdg-open "${local}"`;

@@ -1,5 +1,6 @@
 {
   "puerto": 3000,
+  "claveAdmin": "admin",
   "peliculas": ["./peliculas"],
   "series": ["./series"],
   "caratulas": ["./caratulas"]

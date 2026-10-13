@@ -8,35 +8,61 @@
 </head>
 <body>
 
-<header>
+<!-- Selección de perfil -->
+<section id="profiles">
+  <button class="btn ghost icon fs-toggle" type="button" title="Pantalla completa (F)" aria-label="Pantalla completa">
+    <svg class="i-expand" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    <svg class="i-compress" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
+  </button>
+  <div class="pf-wrap">
+    <h1 class="brand">Cine local</h1>
+    <h2>¿Quién está viendo?</h2>
+    <div id="profileRow" class="profile-row" role="list"></div>
+    <button id="pfManage" class="btn ghost manage" type="button" aria-pressed="false">Administrar perfiles</button>
+    <p id="pfMsg" class="pf-msg"></p>
+  </div>
+</section>
+
+<header id="appHeader" hidden>
   <h1>Cine local</h1>
   <nav class="tabs" aria-label="Biblioteca">
     <button class="tab on" data-tab="movies" type="button">Películas <span id="cMovies" class="count"></span></button>
     <button class="tab" data-tab="series" type="button">Series <span id="cSeries" class="count"></span></button>
+    <button class="tab" data-tab="history" type="button">Mi historial</button>
   </nav>
   <input id="q" class="ctrl" type="search" placeholder="Buscar…" aria-label="Buscar">
   <button id="rescan" class="btn ghost" type="button" title="Volver a leer las carpetas">Actualizar</button>
-  <button id="fs" class="btn ghost icon" type="button" title="Pantalla completa (F)" aria-label="Pantalla completa">
+  <button class="btn ghost icon fs-toggle" type="button" title="Pantalla completa (F)" aria-label="Pantalla completa">
     <svg class="i-expand" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
     <svg class="i-compress" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
   </button>
+  <button id="me" class="me" type="button" title="Cambiar de perfil"></button>
 </header>
 
-<main>
+<main id="appMain" hidden>
   <div id="warn" hidden></div>
   <p id="info"></p>
 
   <div id="grid"></div>
+  <div id="history" class="hist" hidden></div>
 
   <section id="detail" hidden>
-    <button id="back" class="btn ghost" type="button">‹ Series</button>
+    <button id="back" class="btn ghost" type="button">‹ Volver</button>
     <div class="detail-top">
       <div class="poster" id="dPoster"></div>
       <div class="detail-info">
         <h2 id="sTitle"></h2>
         <p id="sMeta" class="meta"></p>
-        <button id="resume" class="btn" type="button"></button>
+        <p id="sRating" class="rating-line"></p>
+        <div class="actions">
+          <button id="resume" class="btn" type="button"></button>
+          <button id="rateBtn" class="btn ghost" type="button"></button>
+        </div>
       </div>
+      <aside class="reviews-box">
+        <h3>Reseñas</h3>
+        <div id="reviews" class="reviews" tabindex="0" aria-label="Reseñas de los usuarios"></div>
+      </aside>
     </div>
     <div id="chips" class="chips" role="tablist" aria-label="Temporadas"></div>
     <ol id="episodes" class="eps"></ol>
@@ -55,6 +81,7 @@
   </section>
 </main>
 
+<!-- Reproductor -->
 <dialog id="dlg" aria-label="Reproductor">
   <div class="pbar">
     <button class="btn ghost" id="prev" type="button" title="Anterior (P)">‹ Anterior</button>
@@ -65,6 +92,62 @@
   </div>
   <video id="player" controls playsinline></video>
   <div id="notice" role="status" hidden></div>
+</dialog>
+
+<!-- Nuevo perfil -->
+<dialog id="newDlg" class="modal" aria-label="Nuevo perfil">
+  <h3 id="npTitle">Nuevo perfil</h3>
+  <div class="np-top">
+    <span id="npPrev" class="np-prev"></span>
+    <div class="np-photo">
+      <button id="npPick" class="btn ghost" type="button">Elegir foto (opcional)</button>
+      <button id="npClear" class="btn ghost" type="button" hidden>Quitar foto</button>
+      <input id="npFile" type="file" accept="image/*" hidden>
+    </div>
+  </div>
+  <label class="field">Nombre de usuario
+    <input id="npName" class="ctrl" type="text" maxlength="24" autocomplete="off" spellcheck="false">
+  </label>
+  <p id="npErr" class="err" hidden></p>
+  <div class="dlg-actions">
+    <button id="npDelete" class="btn danger" type="button" hidden>Eliminar perfil</button>
+    <button id="npCancel" class="btn ghost" type="button">Cancelar</button>
+    <button id="npCreate" class="btn" type="button">Crear perfil</button>
+  </div>
+</dialog>
+
+<!-- Eliminar perfil (pide contraseña de administrador) -->
+<dialog id="delDlg" class="modal" aria-label="Eliminar perfil">
+  <h3 id="delTitle">Eliminar perfil</h3>
+  <p id="delText" class="warn-text"></p>
+  <label class="field">Contraseña de administrador
+    <input id="delPass" class="ctrl" type="password" autocomplete="off">
+  </label>
+  <p id="delErr" class="err" hidden></p>
+  <div class="dlg-actions">
+    <button id="delCancel" class="btn ghost" type="button">Cancelar</button>
+    <button id="delOk" class="btn danger" type="button">Eliminar</button>
+  </div>
+</dialog>
+
+<!-- Calificar / reseñar -->
+<dialog id="rateDlg" class="modal" aria-label="Calificar">
+  <h3 id="rtTitle"></h3>
+  <div id="stars" class="stars" role="radiogroup" aria-label="Calificación">
+    <button class="star" type="button" data-v="1" role="radio" aria-label="1 estrella">✩</button>
+    <button class="star" type="button" data-v="2" role="radio" aria-label="2 estrellas">✩</button>
+    <button class="star" type="button" data-v="3" role="radio" aria-label="3 estrellas">✩</button>
+    <button class="star" type="button" data-v="4" role="radio" aria-label="4 estrellas">✩</button>
+    <button class="star" type="button" data-v="5" role="radio" aria-label="5 estrellas">✩</button>
+  </div>
+  <p class="hint">Elige con Enter o con las teclas 1 a 5. Ctrl + Enter guarda.</p>
+  <textarea id="rtText" class="ctrl" rows="4" maxlength="1000" placeholder="Escribe tu reseña (opcional)"></textarea>
+  <p id="rtErr" class="err" hidden></p>
+  <div class="dlg-actions">
+    <button id="rtDelete" class="btn ghost" type="button" hidden>Eliminar</button>
+    <button id="rtCancel" class="btn ghost" type="button">Cancelar</button>
+    <button id="rtSave" class="btn" type="button">Guardar</button>
+  </div>
 </dialog>
 
 <script src="/js/app.js"></script>
