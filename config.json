@@ -1,0 +1,6 @@
+{
+  "puerto": 3000,
+  "peliculas": ["./peliculas"],
+  "series": ["./series"],
+  "caratulas": ["./caratulas"]
+}
