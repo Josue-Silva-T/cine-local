@@ -324,7 +324,12 @@
     info.textContent = 'Leyendo carpetas…';
     try {
       const r = await fetch('/api/library', { cache: 'no-store' });
-      if (!r.ok) throw new Error(r.status);
+      if (!r.ok) {
+        let msg = 'código ' + r.status;
+        try { msg = (await r.json()).error || msg; } catch {}
+        info.textContent = 'El servidor falló al leer las carpetas: ' + msg + '. Revisa la consola donde corre node server.js.';
+        return;
+      }
       state.lib = await r.json();
     } catch {
       info.textContent = 'No se pudo conectar con el servidor. ¿Sigue abierto "node server.js"?';

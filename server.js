@@ -46,6 +46,14 @@ execFile('ffmpeg', ['-version'], e => {
 const natural = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 const visible = n => !n.startsWith('.') && !n.startsWith('$');
 const readdir = dir => fs.promises.readdir(dir, { withFileTypes: true });
+// Tipo real de una entrada de carpeta; sigue enlaces simbólicos y descarta los rotos.
+async function kindOf(dir, d) {
+  if (d.isSymbolicLink()) {
+    try { const st = await fs.promises.stat(path.join(dir, d.name)); return st.isDirectory() ? 'dir' : st.isFile() ? 'file' : null; }
+    catch { return null; }
+  }
+  return d.isDirectory() ? 'dir' : d.isFile() ? 'file' : null;
+}
 const encodeRel = rel => rel.split('/').map(encodeURIComponent).join('/');
 const mediaUrl = (kind, idx, rel) => `/media/${kind}/${idx}/${encodeRel(rel)}`;
 
@@ -109,8 +117,9 @@ async function walkVideos(abs, rel, out) {
   list = list.filter(d => visible(d.name)).sort((a, b) => natural(a.name, b.name));
   for (const d of list) {
     const r = rel ? rel + '/' + d.name : d.name;
-    if (d.isDirectory()) await walkVideos(path.join(abs, d.name), r, out);
-    else if (VIDEO.test(d.name)) out.push({ abs: path.join(abs, d.name), rel: r });
+    const kind = await kindOf(abs, d);
+    if (kind === 'dir') await walkVideos(path.join(abs, d.name), r, out);
+    else if (kind === 'file' && VIDEO.test(d.name)) out.push({ abs: path.join(abs, d.name), rel: r });
   }
 }
 
@@ -141,8 +150,10 @@ async function scan() {
   // Carátulas, indexadas por nombre de archivo (sin extensión), ej. GOT.jpg -> "got"
   const covers = new Map();
   for (const r of await existing('caratulas')) {
-    for (const f of await readdir(r.abs)) {
-      if (f.isFile() && IMAGE.test(f.name)) {
+    let imgs = [];
+    try { imgs = await readdir(r.abs); } catch (e) { warnings.push(`No se pudo leer la carpeta de caratulas: ${e.code || e.message}`); }
+    for (const f of imgs) {
+      if (IMAGE.test(f.name) && (await kindOf(r.abs, f)) === 'file') {
         const key = path.parse(f.name).name.toLowerCase();
         if (!covers.has(key)) covers.set(key, mediaUrl('caratulas', r.i, f.name));
       }
@@ -159,9 +170,11 @@ async function scan() {
     const files = [];
     await walkVideos(r.abs, '', files);
     for (const f of files) {
-      const base = path.parse(path.basename(f.rel)).name;
-      const { abbr, title } = parseName(base);
-      movies.push({ abbr, title, cover: findCover(abbr, base, title), entry: await makeEntry('peliculas', r.i, f) });
+      try {
+        const base = path.parse(path.basename(f.rel)).name;
+        const { abbr, title } = parseName(base);
+        movies.push({ abbr, title, cover: findCover(abbr, base, title), entry: await makeEntry('peliculas', r.i, f) });
+      } catch (e) { warnings.push(`Se omitió ${f.rel}: ${e.code || e.message}`); }
     }
   }
   movies.sort((a, b) => natural(a.title, b.title));
@@ -170,7 +183,11 @@ async function scan() {
   // Temporada y capítulo salen del nombre del archivo: T1C4_lucha.mkv
   const series = [];
   for (const r of await existing('series')) {
-    const dirs = (await readdir(r.abs)).filter(d => d.isDirectory() && visible(d.name));
+    let dirs = [];
+    try {
+      const all = (await readdir(r.abs)).filter(d => visible(d.name));
+      for (const d of all) if ((await kindOf(r.abs, d)) === 'dir') dirs.push(d);
+    } catch (e) { warnings.push(`No se pudo leer la carpeta de series: ${e.code || e.message}`); }
     for (const d of dirs) {
       const files = [];
       await walkVideos(path.join(r.abs, d.name), d.name, files);
@@ -191,9 +208,13 @@ async function scan() {
           const text = tidy(base);
           n = episodeNumber(text); epTitle = stripNumber(text);
         }
+        let entry;
+        try { entry = await makeEntry('series', r.i, f); }
+        catch (e) { warnings.push(`Se omitió ${f.rel}: ${e.code || e.message}`); continue; }
         if (!bySeason.has(season)) bySeason.set(season, []);
-        bySeason.get(season).push({ n, title: epTitle, rel: f.rel, entry: await makeEntry('series', r.i, f) });
+        bySeason.get(season).push({ n, title: epTitle, rel: f.rel, entry });
       }
+      if (!bySeason.size) continue;
       const seasons = [...bySeason.entries()].sort((x, y) => x[0] - y[0]).map(([num, episodes]) => ({
         n: num,
         episodes: episodes.sort((x, y) => (x.n ?? 1e9) - (y.n ?? 1e9) || natural(x.rel, y.rel))
@@ -342,7 +363,8 @@ const server = http.createServer(async (req, res) => {
     if (STATIC[p]) return serveFile(req, res, path.join(ROOT, STATIC[p]), false);
     res.writeHead(404); res.end('No encontrado');
   } catch (e) {
-    res.writeHead(500); res.end('Error del servidor');
+    console.error('Error en', req.url, '->', e);
+    json(res, 500, { error: e.message || String(e) });
   }
 });
 
