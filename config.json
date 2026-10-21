@@ -1,6 +1,8 @@
 {
   "puerto": 3000,
   "claveAdmin": "admin",
+  "convertirVideos": true,
+  "optimizarCaratulas": true,
   "peliculas": ["./peliculas"],
   "series": ["./series"],
   "caratulas": ["./caratulas"]

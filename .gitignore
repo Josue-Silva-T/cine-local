@@ -1,0 +1,16 @@
+# Datos de los usuarios (perfiles, historial, reseñas, fotos)
+data/
+
+# Audio convertido con ffmpeg
+.cache/
+
+# Tus videos y carátulas no se suben al repositorio
+peliculas/*
+series/*
+caratulas/*
+!peliculas/.gitkeep
+!series/.gitkeep
+!caratulas/.gitkeep
+
+node_modules/
+*.log

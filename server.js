@@ -22,6 +22,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { exec, execFile, spawn } = require('child_process');
+const { optimizar: optimizarCaratulas } = require('./optimizar-caratulas.js');
 
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'config.json');
@@ -32,7 +33,7 @@ const NO_OPEN = process.argv.includes('--no-open');
 const VIDEO = /\.(mp4|m4v|webm|mov|mkv|ogv|avi)$/i;
 const IMAGE = /\.(jpe?g|png|webp)$/i;
 const KINDS = ['peliculas', 'series', 'caratulas'];
-const DEFAULTS = { puerto: 3000, claveAdmin: 'admin', peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
+const DEFAULTS = { puerto: 3000, claveAdmin: 'admin', convertirVideos: true, optimizarCaratulas: true, peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -41,10 +42,13 @@ const MIME = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp'
 };
 
-let FFMPEG = false;
-execFile('ffmpeg', ['-version'], e => {
-  FFMPEG = !e;
-  if (!FFMPEG) console.log('  Aviso: ffmpeg no está instalado; no se podrá arreglar el audio.\n  Instálalo con:  sudo apt install ffmpeg\n');
+let FFMPEG = false, NICE = false;
+const ffmpegReady = new Promise(resolve => {
+  execFile('ffmpeg', ['-version'], e => {
+    FFMPEG = !e;
+    if (!FFMPEG) console.log('  Aviso: ffmpeg no está instalado. Los videos que el navegador no soporta (MKV, AVI, HEVC…)\n  no se podrán convertir a MP4. Instálalo con:  sudo apt install ffmpeg\n');
+    execFile('nice', ['-n', '10', 'true'], err => { NICE = !err; resolve(); });
+  });
 });
 
 const natural = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
@@ -72,7 +76,9 @@ function loadConfig() {
   }
   const cfg = {
     puerto: Number(user.puerto) || DEFAULTS.puerto,
-    claveAdmin: typeof user.claveAdmin === 'string' ? user.claveAdmin : DEFAULTS.claveAdmin
+    claveAdmin: typeof user.claveAdmin === 'string' ? user.claveAdmin : DEFAULTS.claveAdmin,
+    convertirVideos: user.convertirVideos !== false,
+    optimizarCaratulas: user.optimizarCaratulas !== false
   };
   for (const k of KINDS) {
     const v = user[k];
@@ -153,6 +159,14 @@ async function scan() {
     }
     return out;
   };
+
+  // Carátulas: convierte a .webp (y borra el original) cualquier imagen pendiente
+  if (cfg.optimizarCaratulas) {
+    const dirs = (await existing('caratulas')).map(r => r.abs);
+    const rep = await optimizarCaratulas(dirs);
+    rep.convertidas.forEach(c => console.log(`  Carátula optimizada: ${path.basename(c.origen)} → ${path.basename(c.destino)} (${(c.antes / 1024).toFixed(0)} KB → ${(c.despues / 1024).toFixed(0)} KB)`));
+    rep.errores.forEach(e => warnings.push(`No se pudo optimizar la carátula ${path.basename(e.archivo)}: ${e.error}`));
+  }
 
   // Carátulas, indexadas por nombre de archivo (sin extensión), ej. GOT.jpg -> "got"
   const covers = new Map();
@@ -276,63 +290,195 @@ function serveFile(req, res, abs, cacheable) {
   });
 }
 
-/* ---------- Conversión de audio (video se copia, audio -> AAC u Opus) ---------- */
-const jobs = new Map();
+/* ---------- Conversión automática a MP4 (H.264 + AAC) ----------
+   - Los videos compatibles con el navegador se sirven tal cual.
+   - Los demás (MKV, AVI, MOV, HEVC, audio AC3/DTS…) se convierten a .mp4 en .cache/:
+     el video se copia si ya es H.264 y solo se recodifica cuando hace falta; el audio pasa a AAC.
+   - Un proceso en segundo plano convierte toda la biblioteca; si alguien reproduce un video
+     que aún no está listo, ese video pasa al frente.
+*/
+const CACHE_VERSION = 'v2';
+const PROBE_FILE = path.join(CACHE_DIR, 'probe.json');
+const jobs = new Map();            // id -> { state, progress, error, abs, out, name, decision, bg }
+const bgQueue = [];                // trabajos en cola (segundo plano)
+const probeQueue = [];             // archivos por analizar
+const stats = { total: 0, done: 0, failed: 0 };
+let bgRunning = 0, probing = false, probeCache = null, probeTimer = null;
 
-function probeDuration(abs) {
-  return new Promise(res => execFile('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', abs],
-    (e, out) => res(e ? 0 : parseFloat(out) || 0)));
+const cacheId = (abs, st) => crypto.createHash('sha1').update([abs, st.size, Math.round(st.mtimeMs), CACHE_VERSION].join('|')).digest('hex').slice(0, 24);
+const cachedPath = id => path.join(CACHE_DIR, id + '.mp4');
+
+function loadProbeCache() {
+  if (probeCache) return probeCache;
+  try { probeCache = JSON.parse(fs.readFileSync(PROBE_FILE, 'utf8')); } catch { probeCache = {}; }
+  try { for (const f of fs.readdirSync(CACHE_DIR)) if (f.endsWith('.part')) fs.unlinkSync(path.join(CACHE_DIR, f)); } catch {}
+  return probeCache;
+}
+function saveProbeSoon() {
+  if (probeTimer) return;
+  probeTimer = setTimeout(() => {
+    probeTimer = null;
+    try { fs.mkdirSync(CACHE_DIR, { recursive: true }); fs.writeFileSync(PROBE_FILE, JSON.stringify(probeCache)); } catch {}
+  }, 1000);
 }
 
-function startJob(job, abs, out, codec) {
+function ffprobe(abs) {
+  return new Promise(resolve => execFile('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', abs],
+    { maxBuffer: 8e6, timeout: 60000 }, (e, out) => {
+      if (e) return resolve(null);
+      try {
+        const j = JSON.parse(out), streams = j.streams || [];
+        const v = streams.find(s => s.codec_type === 'video' && !(s.disposition && s.disposition.attached_pic));
+        const a = streams.find(s => s.codec_type === 'audio');
+        resolve({
+          duration: parseFloat(j.format && j.format.duration) || 0,
+          video: v ? { codec: v.codec_name, pix_fmt: v.pix_fmt } : null,
+          audio: a ? { codec: a.codec_name, channels: a.channels || 2 } : null
+        });
+      } catch { resolve(null); }
+    }));
+}
+
+// ¿Lo reproduce cualquier navegador tal cual? Si no, cómo convertirlo.
+function decide(info, abs) {
+  const v = info.video, a = info.audio;
+  if (!v) return { convert: false };
+  const ext = path.extname(abs).toLowerCase();
+  const h264Ok = v.codec === 'h264' && v.pix_fmt === 'yuv420p';
+  const audioOk = !a || a.codec === 'aac' || a.codec === 'mp3';
+  if ((ext === '.mp4' || ext === '.m4v') && h264Ok && audioOk) return { convert: false };
+  if (ext === '.webm' && ['vp8', 'vp9', 'av1'].includes(v.codec) && (!a || ['opus', 'vorbis'].includes(a.codec))) return { convert: false };
+  return { convert: true, copyVideo: h264Ok, copyAudio: !!a && a.codec === 'aac' };
+}
+
+function buildArgs(job, part) {
+  const d = job.decision;
+  return ['-y', '-v', 'error', '-nostats', '-progress', 'pipe:1', '-fflags', '+genpts', '-i', job.abs,
+    '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-map_chapters', '-1',
+    ...(d.copyVideo
+      ? ['-c:v', 'copy', '-avoid_negative_ts', 'make_zero']
+      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-profile:v', 'high']),
+    ...(d.copyAudio
+      ? ['-c:a', 'copy']
+      : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']),
+    '-movflags', '+faststart', '-f', 'mp4', part];
+}
+
+function startJob(job) {
+  job.state = 'working';
   fs.mkdirSync(CACHE_DIR, { recursive: true });
-  const part = out + '.part';
-  const audio = codec === 'opus'
-    ? ['-c:a', 'libopus', '-b:a', '160k', '-ac', '2', '-strict', '-2']
-    : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2'];
-  probeDuration(abs).then(dur => {
-    const args = ['-y', '-v', 'error', '-nostats', '-progress', 'pipe:1', '-i', abs,
-      '-map', '0:v:0', '-map', '0:a:0', '-c:v', 'copy', ...audio, '-sn', '-dn',
-      '-movflags', '+faststart', '-f', 'mp4', part];
-    const ff = spawn('ffmpeg', args);
-    let errText = '';
-    ff.stdout.on('data', d => {
-      const line = d.toString().split('\n').reverse().find(l => l.startsWith('out_time_')) || '';
-      const m = /out_time_(?:us|ms)=(\d+)/.exec(line);
-      if (m && dur) job.progress = Math.min(parseInt(m[1], 10) / 1e6 / dur, 0.99);
-    });
-    ff.stderr.on('data', d => { errText += d.toString(); });
-    ff.on('error', () => { job.state = 'error'; job.error = 'ffmpeg'; });
-    ff.on('close', code => {
-      if (code === 0) {
-        fs.rename(part, out, e => { job.state = e ? 'error' : 'ready'; job.progress = 1; if (e) job.error = e.message; });
-      } else {
-        fs.unlink(part, () => {});
-        job.state = 'error';
-        job.error = errText.trim().split('\n').pop() || ('ffmpeg salió con código ' + code);
-      }
-    });
+  const part = job.out + '.part';
+  const args = buildArgs(job, part);
+  const ff = job.bg && NICE ? spawn('nice', ['-n', '10', 'ffmpeg', ...args]) : spawn('ffmpeg', args);
+  let errText = '';
+  const finish = (ok, error) => {
+    if (job.state !== 'working') return;
+    job.state = ok ? 'ready' : 'error';
+    job.progress = ok ? 1 : job.progress;
+    job.error = ok ? null : error;
+    ok ? stats.done++ : stats.failed++;
+    if (!ok) fs.unlink(part, () => {});
+    if (job.bg) { bgRunning--; pumpBg(); }
+  };
+  ff.stdout.on('data', d => {
+    const line = d.toString().split('\n').reverse().find(l => l.startsWith('out_time_us=') || l.startsWith('out_time_ms=')) || '';
+    const m = /=(\d+)/.exec(line);
+    if (m && job.duration) job.progress = Math.min(parseInt(m[1], 10) / 1e6 / job.duration, 0.99);
+  });
+  ff.stderr.on('data', d => { errText += d.toString(); });
+  ff.on('error', e => finish(false, e.message));
+  ff.on('close', code => {
+    if (code === 0) fs.rename(part, job.out, e => finish(!e, e && e.message));
+    else finish(false, errText.trim().split('\n').pop() || `ffmpeg salió con código ${code}`);
   });
 }
 
-async function prepare(kind, idx, rel, codec) {
+function pumpBg() {
+  if (bgRunning > 0) return;
+  const job = bgQueue.shift();
+  if (!job) return;
+  bgRunning++;
+  startJob(job);
+}
+
+function makeJob(id, abs, info, bg) {
+  const job = { id, state: 'queued', progress: 0, error: null, abs, out: cachedPath(id), name: path.basename(abs), decision: info.decision, duration: info.duration || 0, bg };
+  jobs.set(id, job);
+  stats.total++;
+  return job;
+}
+
+async function infoFor(abs, id) {
+  const cache = loadProbeCache();
+  if (cache[id]) return cache[id];
+  const raw = await ffprobe(abs);
+  if (!raw) return null;
+  cache[id] = { ...raw, decision: decide(raw, abs) };
+  saveProbeSoon();
+  return cache[id];
+}
+
+// Segundo plano: analiza la biblioteca y encola lo que haga falta convertir.
+async function enqueueLibrary(lib) {
+  await ffmpegReady;
+  if (!FFMPEG || !loadConfig().cfg.convertirVideos) return;
+  const entries = [...lib.movies.map(m => m.entry), ...lib.series.flatMap(s => s.seasons.flatMap(se => se.episodes.map(e => e.entry)))];
+  probeQueue.push(...entries);
+  if (probing) return;
+  probing = true;
+  try {
+    while (probeQueue.length) {
+      const e = probeQueue.shift();
+      const abs = resolveMedia(e.kind, e.root, e.rel);
+      if (!abs) continue;
+      const st = await fs.promises.stat(abs).catch(() => null);
+      if (!st) continue;
+      const id = cacheId(abs, st);
+      if (jobs.has(id) || fs.existsSync(cachedPath(id))) continue;
+      const info = await infoFor(abs, id);
+      if (info && info.decision.convert) { bgQueue.push(makeJob(id, abs, info, true)); pumpBg(); }
+    }
+  } finally { probing = false; }
+}
+
+// Al reproducir: devuelve la URL lista, o el avance si todavía se está convirtiendo.
+async function playable(kind, idx, rel) {
   const abs = resolveMedia(kind, idx, rel);
   if (!abs || !VIDEO.test(abs)) return [400, { error: 'ruta no válida' }];
-  if (!FFMPEG) return [501, { error: 'ffmpeg' }];
   const st = await fs.promises.stat(abs).catch(() => null);
   if (!st || !st.isFile()) return [404, { error: 'no encontrado' }];
-  codec = codec === 'opus' ? 'opus' : 'aac';
-  const id = crypto.createHash('sha1').update([abs, st.size, st.mtimeMs, codec].join('|')).digest('hex').slice(0, 24);
-  const out = path.join(CACHE_DIR, id + '.mp4');
-  const url = '/cache/' + id + '.mp4';
-  if (fs.existsSync(out)) return [200, { state: 'ready', progress: 1, url }];
+  const direct = { state: 'ready', url: mediaUrl(kind, idx, rel), converted: false };
+  await ffmpegReady;
+  if (!FFMPEG) return [200, { ...direct, note: 'sin-ffmpeg' }];
+
+  const id = cacheId(abs, st);
+  if (fs.existsSync(cachedPath(id))) return [200, { state: 'ready', url: '/cache/' + id + '.mp4', converted: true }];
+
   let job = jobs.get(id);
-  if (!job || job.state === 'error') {
-    job = { state: 'working', progress: 0, error: null };
-    jobs.set(id, job);
-    startJob(job, abs, out, codec);
+  if (!job) {
+    const info = await infoFor(abs, id);
+    if (!info || !info.decision.convert) return [200, direct];
+    job = makeJob(id, abs, info, false);
+    startJob(job);
+  } else if (job.state === 'queued') {                       // estaba en cola: pasa al frente
+    const i = bgQueue.indexOf(job);
+    if (i >= 0) bgQueue.splice(i, 1);
+    job.bg = false;
+    startJob(job);
   }
-  return [200, { state: job.state, progress: job.progress, error: job.error, url: job.state === 'ready' ? url : null }];
+  if (job.state === 'error') return [200, { ...direct, warning: job.error }];   // intenta el original
+  if (job.state === 'ready') return [200, { state: 'ready', url: '/cache/' + id + '.mp4', converted: true }];
+  return [200, { state: 'working', progress: job.progress }];
+}
+
+function conversionStatus() {
+  const working = [...jobs.values()].filter(j => j.state === 'working');
+  const cur = working[0];
+  return {
+    active: probing || bgQueue.length > 0 || working.length > 0,
+    total: stats.total, done: stats.done, failed: stats.failed, pending: bgQueue.length,
+    current: cur ? { name: cur.name, progress: cur.progress } : null
+  };
 }
 
 /* ---------- Servidor ---------- */
@@ -558,17 +704,22 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const p = decodeURIComponent(url.pathname);
 
-    if (p === '/api/library') return json(res, 200, await scan());
+    if (p === '/api/library') {
+      const lib = await scan();
+      enqueueLibrary(lib).catch(() => {});
+      return json(res, 200, lib);
+    }
 
     if (p.startsWith('/api/') && await profileApi(req, res, p, url)) return;
 
     if (/^\/avatars\/p[a-f0-9]+(-[a-z0-9]+)?\.(jpg|png|webp)$/.test(p)) return serveFile(req, res, path.join(AVATAR_DIR, p.slice(9)), true);
 
-    if (p === '/api/prepare') {
-      const [code, body] = await prepare(url.searchParams.get('kind'), parseInt(url.searchParams.get('root'), 10),
-        url.searchParams.get('path') || '', url.searchParams.get('codec'));
+    if (p === '/api/play') {
+      const [code, body] = await playable(url.searchParams.get('kind'), parseInt(url.searchParams.get('root'), 10), url.searchParams.get('path') || '');
       return json(res, code, body);
     }
+
+    if (p === '/api/conversion') return json(res, 200, conversionStatus());
 
     if (p.startsWith('/media/')) {
       const [, , kind, idx, ...rest] = p.split('/');
@@ -612,6 +763,7 @@ server.listen(PORT, LAN ? '0.0.0.0' : '127.0.0.1', () => {
   if (cfg.claveAdmin === 'admin') console.log('  Aviso: la contraseña de administrador sigue siendo "admin". Cámbiala en config.json (claveAdmin).');
   else if (!cfg.claveAdmin) console.log('  Aviso: sin contraseña de administrador (claveAdmin vacía): no se podrán eliminar perfiles.');
   console.log('\n  Rutas editables en config.json. Ctrl + C para detener.\n');
+  scan().then(enqueueLibrary).catch(e => console.error('Escaneo inicial:', e.message));
   if (!NO_OPEN) {
     const cmd = process.platform === 'darwin' ? `open "${local}"` : `xdg-open "${local}"`;
     exec(cmd, () => {});

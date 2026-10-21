@@ -2,7 +2,7 @@
   'use strict';
   const $ = id => document.getElementById(id);
   const grid = $('grid'), info = $('info'), warn = $('warn'), empty = $('empty'), detail = $('detail'), histEl = $('history'), q = $('q');
-  const dlg = $('dlg'), player = $('player'), notice = $('notice');
+  const pl = $('pl'), player = $('player');
   const profilesEl = $('profiles'), appHeader = $('appHeader'), appMain = $('appMain');
   const rateDlg = $('rateDlg'), newDlg = $('newDlg'), delDlg = $('delDlg');
   const MODALS = [rateDlg, newDlg, delDlg];
@@ -46,20 +46,40 @@
   const getProg = e => state.hist[e.key] || null;
   const barPct = e => { const p = getProg(e); return p && p.d && p.t > 5 && p.t < p.d - 5 ? p.t / p.d * 100 : 0; };
 
-  function recordProgress(entry, ended) {
+  const LSP = 'cl:prog:';   // copia local: cl:prog:<perfil>:<clave del video>
+
+  function sendProgress(key, rec, unloading) {
+    const body = JSON.stringify({ profile: state.me.id, key, t: rec.t, d: rec.d, pct: rec.pct });
+    if (unloading && navigator.sendBeacon) { navigator.sendBeacon('/api/history', new Blob([body], { type: 'application/json' })); return; }
+    fetch('/api/history', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
+  }
+
+  // Guarda posición y porcentaje: en memoria, en localStorage y en el servidor.
+  function recordProgress(entry, ended, unloading) {
     if (!state.me) return;
     const d = player.duration;
     if (!isFinite(d) || !d) return;
-    const t = ended ? 0 : player.currentTime;
+    const t = player.currentTime;
     if (!ended && t < 3) return;
+    const finished = ended || t > d - 8;
     const prev = state.hist[entry.key];
-    const now = ended || t > d - 8 ? 100 : Math.round(t / d * 100);
-    const rec = { t, d, pct: Math.max(prev ? prev.pct || 0 : 0, now), at: Date.now() };
+    const rec = { t: finished ? 0 : t, d, pct: Math.max(prev ? prev.pct || 0 : 0, finished ? 100 : Math.round(t / d * 100)), at: Date.now() };
     state.hist[entry.key] = rec;
-    fetch('/api/history', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
-      body: JSON.stringify({ profile: state.me.id, key: entry.key, t: rec.t, d: rec.d, pct: rec.pct })
-    }).catch(() => {});
+    try { localStorage.setItem(LSP + state.me.id + ':' + entry.key, JSON.stringify(rec)); } catch {}
+    sendProgress(entry.key, rec, unloading);
+  }
+
+  // Si el servidor no llegó a recibir algún guardado, se recupera de la copia local.
+  function mergeLocalProgress() {
+    const pre = LSP + state.me.id + ':';
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(pre)) continue;
+      try {
+        const rec = JSON.parse(localStorage.getItem(k)), key = k.slice(pre.length), cur = state.hist[key];
+        if (rec && (!cur || rec.at > cur.at)) { state.hist[key] = rec; sendProgress(key, rec); }
+      } catch {}
+    }
   }
 
   /* ---------- avatares y carátulas ---------- */
@@ -187,6 +207,7 @@
     info.textContent = 'Cargando…';
     try { await Promise.all([loadUser(), loadLibrary()]); }
     catch (e) { info.textContent = e.message; return; }
+    pollConversion();
     showTab();
     const first = grid.firstElementChild;
     focusEl(first || document.querySelector('.tab.on'));
@@ -300,6 +321,7 @@
     state.hist = h.history || {};
     state.mine = h.ratings || {};
     state.summary = s;
+    mergeLocalProgress();
   }
 
   function buildIndex() {
@@ -323,6 +345,21 @@
     }
     state.lib = await r.json();
     buildIndex();
+  }
+
+  /* ---------- conversión en segundo plano ---------- */
+  let convTimer = 0;
+  async function pollConversion() {
+    clearTimeout(convTimer);
+    let c;
+    try { c = await api('/api/conversion'); } catch { return; }
+    const el = $('conv');
+    if (c.active) {
+      el.hidden = false;
+      el.textContent = `Optimizando videos para reproducirlos en cualquier dispositivo… ${c.done} de ${c.total}` +
+        (c.current ? ` · ${c.current.name} (${Math.round(c.current.progress * 100)}%)` : '');
+      convTimer = setTimeout(pollConversion, 3000);
+    } else el.hidden = true;
   }
 
   /* ---------- vistas ---------- */
@@ -450,7 +487,7 @@
     $('sRating').textContent = ratingText([e.key]);
     const r = $('resume');
     r.textContent = p && p.t > 5 ? `Continuar viendo · ${p.pct || 0}%` : p && p.pct >= 95 ? 'Ver de nuevo' : 'Reproducir';
-    r.onclick = () => play([{ entry: e, title: m.title }], 0);
+    r.onclick = () => play([{ entry: e, title: m.title, main: m.title, sub: '' }], 0);
     const rb = $('rateBtn');
     rb.textContent = mine ? `${starStr(mine.stars)}  Editar mi reseña` : '✩ Calificar';
     rb.onclick = () => openRate(e, m.title);
@@ -473,7 +510,8 @@
     const list = [];
     s.seasons.forEach(se => se.episodes.forEach((e, i) => list.push({
       entry: e.entry, season: se.n, n: e.n ?? i + 1, epTitle: e.title,
-      title: `${s.title} · ${code(se.n, e.n ?? i + 1)}${e.title ? ' · ' + e.title : ''}`
+      title: `${s.title} · ${code(se.n, e.n ?? i + 1)}${e.title ? ' · ' + e.title : ''}`,
+      main: s.title, sub: code(se.n, e.n ?? i + 1) + (e.title ? ' · ' + e.title : '')
     })));
     return list;
   }
@@ -667,123 +705,300 @@
     } catch (e) { $('rtErr').textContent = e.message; $('rtErr').hidden = false; }
   };
 
-  /* ---------- reproductor ---------- */
-  let saveTick = 0, playToken = 0, silentTimer = 0;
-  const fixKey = e => 'clfix:' + e.key;
-  const audioCodec = () => (player.canPlayType('audio/mp4; codecs="mp4a.40.2"') ? 'aac' : 'opus');
+  /* ---------- reproductor propio ---------- */
+  let token = 0, lastFocus = null, idleTimer = 0, dragging = false, wake = null;
+  const playerOpen = () => !pl.hidden;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const fsEl = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const seekBar = $('plSeek'), volBar = $('plVol');
+  const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+  const fmtT = s => {
+    if (!isFinite(s) || s < 0) s = 0;
+    s = Math.floor(s);
+    const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
+  };
 
-  function say(html, bad) {
-    notice.hidden = !html;
-    notice.className = bad ? 'bad' : '';
-    notice.innerHTML = html || '';
+  /* --- controles que se ocultan solos --- */
+  const msgVisible = () => !$('plMsg').hidden;
+  function showControls() {
+    pl.classList.add('show'); pl.classList.remove('idle');
+    clearTimeout(idleTimer);
+    if (!player.paused && !msgVisible()) idleTimer = setTimeout(hideControls, 3000);
   }
+  function hideControls() {
+    if (player.paused || dragging || msgVisible()) return;
+    pl.classList.remove('show'); pl.classList.add('idle');
+  }
+  function showMsg(text, { error = false, progress = null } = {}) {
+    $('plMsg').hidden = false;
+    $('plMsg').classList.toggle('error', error);
+    $('plMsgText').textContent = text;
+    $('plMsgProg').hidden = progress == null;
+    if (progress != null) $('plMsgProg').firstElementChild.style.width = progress + '%';
+    pl.classList.add('busy');
+    pl.classList.add('show'); pl.classList.remove('idle');
+    clearTimeout(idleTimer);
+  }
+  function hideMsg() { $('plMsg').hidden = true; pl.classList.remove('busy'); }
 
-  async function prepareAudio(entry, token) {
-    const url = `/api/prepare?codec=${audioCodec()}&kind=${entry.kind}&root=${entry.root}&path=${encodeURIComponent(entry.rel)}`;
+  /* --- pantalla completa del reproductor --- */
+  function lockLandscape() {
+    try { if (matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {}); } catch {}
+  }
+  function enterFs() {
+    if (fsEl() === pl) return;
+    const f = pl.requestFullscreen || pl.webkitRequestFullscreen;
+    if (!f) return;                                   // p. ej. iPhone: el reproductor ya ocupa toda la pantalla
+    try { const p = f.call(pl); if (p && p.then) p.then(lockLandscape).catch(() => {}); } catch {}
+  }
+  function exitPlayerFs() {
+    if (fsEl() === pl) { try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch {} }
+    try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch {}
+  }
+  const togglePlayerFs = () => (fsEl() === pl ? exitPlayerFs() : enterFs());
+
+  async function lockScreen() {
+    try { if ('wakeLock' in navigator && !wake) { wake = await navigator.wakeLock.request('screen'); wake.addEventListener('release', () => { wake = null; }); } } catch {}
+  }
+  function unlockScreen() { try { wake && wake.release(); } catch {} wake = null; }
+
+  /* --- progreso, tiempo y volumen --- */
+  function paintProgress() {
+    const d = player.duration, t = player.currentTime;
+    if (!isFinite(d) || d <= 0) return;
+    const p = Math.min(100, t / d * 100);
+    let b = 0;
+    try { const br = player.buffered; for (let i = 0; i < br.length; i++) if (br.start(i) <= t + 0.5 && br.end(i) >= t) b = br.end(i) / d * 100; } catch {}
+    seekBar.style.setProperty('--p', p + '%');
+    seekBar.style.setProperty('--b', Math.max(b, p) + '%');
+  }
+  function onTime() {
+    const d = player.duration, t = player.currentTime;
+    if (!dragging && isFinite(d) && d > 0) seekBar.value = Math.round(t / d * 1000);
+    $('plCur').textContent = fmtT(t);
+    $('plRem').textContent = '-' + fmtT((isFinite(d) ? d : 0) - t);
+    paintProgress();
+  }
+  seekBar.addEventListener('input', () => {
+    dragging = true;
+    const d = player.duration;
+    if (!isFinite(d)) return;
+    const t = seekBar.value / 1000 * d;
+    $('plCur').textContent = fmtT(t);
+    $('plRem').textContent = '-' + fmtT(d - t);
+    seekBar.style.setProperty('--p', seekBar.value / 10 + '%');
+    showControls();
+  });
+  seekBar.addEventListener('change', () => {
+    const d = player.duration;
+    if (isFinite(d)) player.currentTime = seekBar.value / 1000 * d;
+    dragging = false;
+    showControls();
+  });
+
+  try { const v = parseFloat(localStorage.getItem('cl:vol')); if (!isNaN(v)) player.volume = clamp(v, 0, 1); } catch {}
+  function paintVol() {
+    const v = player.muted ? 0 : player.volume;
+    volBar.value = Math.round(v * 100);
+    volBar.style.setProperty('--p', Math.round(v * 100) + '%');
+    volBar.style.setProperty('--b', Math.round(v * 100) + '%');
+    pl.dataset.muted = String(player.muted || player.volume === 0);
+  }
+  player.addEventListener('volumechange', () => { paintVol(); try { localStorage.setItem('cl:vol', String(player.volume)); } catch {} });
+  volBar.addEventListener('input', () => { const v = volBar.value / 100; player.muted = v === 0; player.volume = v; });
+  const changeVol = d => { player.muted = false; player.volume = clamp(Math.round((player.volume + d) * 100) / 100, 0, 1); showControls(); };
+  const toggleMute = () => { player.muted = !player.muted; showControls(); };
+  paintVol();
+
+  /* --- adelantar / atrasar con efecto visual --- */
+  const ripAcc = { left: 0, right: 0 }, ripTimer = {};
+  function ripple(side, secs) {
+    const el = $(side === 'left' ? 'plRipL' : 'plRipR');
+    ripAcc[side] += secs;
+    el.querySelector('span').textContent = (side === 'left' ? '−' : '+') + ripAcc[side] + ' s';
+    el.classList.remove('on'); void el.offsetWidth; el.classList.add('on');
+    clearTimeout(ripTimer[side]);
+    ripTimer[side] = setTimeout(() => { ripAcc[side] = 0; }, 900);
+  }
+  ['plRipL', 'plRipR'].forEach(id => $(id).addEventListener('animationend', e => e.currentTarget.classList.remove('on')));   // evita que la animación se repita al reabrir
+  function skip(sec) {
+    const d = player.duration;
+    if (!isFinite(d)) return;
+    player.currentTime = clamp(player.currentTime + sec, 0, d - 0.1);
+    ripple(sec < 0 ? 'left' : 'right', Math.abs(sec));
+    showControls(); onTime();
+  }
+  const togglePlay = () => { if (player.paused) player.play().catch(() => {}); else player.pause(); showControls(); };
+
+  /* --- gestos: táctil (toque, doble toque) y ratón (clic, doble clic) --- */
+  const surface = $('plSurface');
+  const sideOf = x => { const w = surface.clientWidth; return x < w * 0.38 ? 'left' : x > w * 0.62 ? 'right' : 'center'; };
+  let tapTimer = 0, clickTimer = 0, lastTap = { t: 0, side: '' }, streak = { side: '', until: 0 }, lastMouse = 0;
+  surface.addEventListener('pointerup', e => {
+    const now = Date.now();
+    if (e.pointerType === 'mouse') {
+      if (e.button !== 0) return;
+      if (now - lastMouse < 260) { clearTimeout(clickTimer); lastMouse = 0; togglePlayerFs(); }       // doble clic: pantalla completa
+      else { lastMouse = now; clickTimer = setTimeout(togglePlay, 260); }                              // clic: reproducir / pausar
+      return;
+    }
+    const side = sideOf(e.clientX - surface.getBoundingClientRect().left);
+    const dbl = now - lastTap.t < 320 && lastTap.side === side;
+    if (side !== 'center' && (dbl || (streak.side === side && now < streak.until))) {                                            // doble toque lateral: ±10 s
+      clearTimeout(tapTimer);
+      skip(side === 'left' ? -10 : 10);
+      streak = { side, until: now + 800 };
+      lastTap = { t: now, side };
+      return;
+    }
+    if (side === 'center' && dbl) { clearTimeout(tapTimer); togglePlay(); lastTap = { t: 0, side: '' }; return; }
+    lastTap = { t: now, side };
+    clearTimeout(tapTimer);
+    tapTimer = setTimeout(() => (pl.classList.contains('show') ? hideControls() : showControls()), 300);   // un toque: mostrar/ocultar
+  });
+  pl.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') showControls(); });
+
+  /* --- reproducir un elemento de la lista --- */
+  async function resolvePlayable(entry, my) {
+    const url = `/api/play?kind=${entry.kind}&root=${entry.root}&path=${encodeURIComponent(entry.rel)}`;
     for (;;) {
       let r, data;
       try { r = await fetch(url, { cache: 'no-store' }); data = await r.json(); }
-      catch { say('No se pudo conectar con el servidor.', true); return null; }
-      if (token !== playToken) return null;
-      if (r.status === 501) { say('Para arreglar el audio hace falta ffmpeg. Instálalo con <code>sudo apt install ffmpeg</code> y vuelve a pulsar "Arreglar audio".', true); return null; }
-      if (!r.ok || data.state === 'error') { say('No se pudo convertir el audio: ' + (data.error || r.status), true); return null; }
+      catch { throw new Error('No se pudo conectar con el servidor.'); }
+      if (my !== token) return null;
+      if (!r.ok) throw new Error(data.error || 'Error ' + r.status);
+      if (data.note === 'sin-ffmpeg') state.noFfmpeg = true;
       if (data.state === 'ready') return data.url;
       const p = Math.round((data.progress || 0) * 100);
-      say(`Preparando audio compatible… ${p}%<div class="prog"><i style="width:${p}%"></i></div>`);
-      await new Promise(res => setTimeout(res, 1000));
+      showMsg(`Optimizando el video para reproducirlo… ${p}%`, { progress: p });
+      await sleep(1000);
     }
   }
 
-  async function play(list, idx, opts = {}) {
+  function updateNav() {
+    $('plPrev').disabled = current <= 0;
+    $('plNext').disabled = current >= playlist.length - 1;
+    const multi = playlist.length > 1;
+    $('plPrev').hidden = $('plNext').hidden = !multi;
+  }
+
+  async function play(list, idx) {
     if (idx < 0 || idx >= list.length) return;
+    const wasOpen = playerOpen();
+    if (wasOpen && current >= 0 && player.getAttribute('src') && !player.ended) recordProgress(playlist[current].entry);
     playlist = list; current = idx;
-    const token = ++playToken;
-    clearTimeout(silentTimer);
+    const my = ++token;
     const it = list[idx];
-    say('');
-    $('title').textContent = it.title;
-    $('prev').disabled = idx === 0;
-    $('next').disabled = idx === list.length - 1;
-    if (!dlg.open) dlg.showModal();
-
-    let src = it.entry.url;
-    let resumeAt = null;
-    if (opts.resumeAt != null) resumeAt = opts.resumeAt;
-    else { const p = getProg(it.entry); if (p && p.t > 5) resumeAt = p.t; }
-
-    if (opts.fix || localStorage.getItem(fixKey(it.entry))) {
-      player.pause();
-      const fixed = await prepareAudio(it.entry, token);
-      if (token !== playToken) return;
-      if (fixed) { src = fixed; localStorage.setItem(fixKey(it.entry), '1'); say(''); }
-      else if (opts.fix) return;
+    if (!wasOpen) {                                  // se abre en pantalla completa (dentro del gesto del usuario)
+      lastFocus = document.activeElement;
+      pl.hidden = false;
+      document.body.classList.add('pl-open');
+      enterFs();
     }
+    $('plTitle').textContent = it.main || it.title;
+    $('plSub').textContent = it.sub || '';
+    updateNav();
+    pl.dataset.playing = 'false';
+    seekBar.value = 0; seekBar.style.setProperty('--p', '0%'); seekBar.style.setProperty('--b', '0%');
+    $('plCur').textContent = '0:00'; $('plRem').textContent = '-0:00';
+    showMsg('Preparando el video…');
+    if (!wasOpen) $('plPlay').focus({ preventScroll: true });
 
-    player.src = src;
-    player.muted = false;
-    player.onloadedmetadata = () => { if (resumeAt && resumeAt < player.duration - 5) player.currentTime = resumeAt; };
-    player.play().catch(() => {});
-    watchAudio(token, src !== it.entry.url);
+    const p = getProg(it.entry);
+    const resumeAt = p && p.t > 5 ? p.t : null;      // reanuda desde el último segundo guardado
+
+    let url;
+    try { url = await resolvePlayable(it.entry, my); }
+    catch (e) { if (my === token) showMsg(e.message, { error: true }); return; }
+    if (my !== token || !url) return;
+    hideMsg();
+    player.src = url;
+    player.onloadedmetadata = () => { if (resumeAt && resumeAt < player.duration - 5) player.currentTime = resumeAt; onTime(); };
+    player.play().catch(() => showControls());
   }
 
-  function watchAudio(token, alreadyFixed) {
-    if (alreadyFixed) return;
-    silentTimer = setTimeout(function check() {
-      if (token !== playToken) return;
-      if (player.paused || player.currentTime < 1) { silentTimer = setTimeout(check, 1500); return; }
-      const silent =
-        (typeof player.webkitAudioDecodedByteCount === 'number' && player.webkitAudioDecodedByteCount === 0) ||
-        player.mozHasAudio === false ||
-        (player.audioTracks && player.audioTracks.length === 0);
-      if (silent) play(playlist, current, { fix: true, resumeAt: player.currentTime });
-    }, 2500);
-  }
-
-  $('fixAudio').onclick = () => { if (current >= 0) play(playlist, current, { fix: true, resumeAt: player.currentTime || null }); };
-
+  let saveTick = 0;
   player.addEventListener('timeupdate', () => {
+    onTime();
     const now = Date.now();
-    if (now - saveTick < 5000 || current < 0) return;
+    if (now - saveTick < 5000 || current < 0 || player.paused) return;      // guarda cada 5 s mientras se reproduce
     saveTick = now;
     recordProgress(playlist[current].entry);
   });
-  player.addEventListener('pause', () => { if (current >= 0 && dlg.open && !player.ended) recordProgress(playlist[current].entry); });
+  ['progress', 'durationchange', 'loadedmetadata'].forEach(ev => player.addEventListener(ev, onTime));
+  player.addEventListener('play', () => { pl.dataset.playing = 'true'; showControls(); lockScreen(); });
+  player.addEventListener('pause', () => {
+    pl.dataset.playing = 'false'; showControls(); unlockScreen();
+    if (playerOpen() && current >= 0 && !player.ended && player.getAttribute('src')) recordProgress(playlist[current].entry);   // al pausar
+  });
+  player.addEventListener('seeked', () => { if (playerOpen() && current >= 0 && player.getAttribute('src')) recordProgress(playlist[current].entry); });
+  player.addEventListener('waiting', () => { $('plSpin').hidden = false; });
+  ['playing', 'canplay', 'seeked'].forEach(ev => player.addEventListener(ev, () => { $('plSpin').hidden = true; }));
   player.addEventListener('ended', () => {
     recordProgress(playlist[current].entry, true);
     if (current < playlist.length - 1) play(playlist, current + 1);
+    else closePlayer();
   });
   player.addEventListener('error', () => {
     if (!player.getAttribute('src')) return;
-    say('El navegador no pudo reproducir este archivo. Prueba "Arreglar audio"; si sigue igual, el códec de video no es compatible (usa MP4 H.264 o WebM).', true);
+    showMsg(state.noFfmpeg
+      ? 'El navegador no puede reproducir este formato. Instala ffmpeg (sudo apt install ffmpeg) para convertirlo automáticamente.'
+      : 'El navegador no pudo reproducir este archivo.', { error: true });
   });
-  window.addEventListener('pagehide', () => { if (dlg.open && current >= 0) recordProgress(playlist[current].entry); });
+
+  // Último guardado antes de cerrar la pestaña, minimizar o cambiar de aplicación.
+  const flushProgress = () => { if (playerOpen() && current >= 0 && state.me && player.getAttribute('src')) recordProgress(playlist[current].entry, false, true); };
+  window.addEventListener('pagehide', flushProgress);
+  window.addEventListener('beforeunload', flushProgress);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushProgress(); });
 
   function closePlayer() {
-    playToken++;
-    clearTimeout(silentTimer);
-    if (current >= 0 && !player.ended) recordProgress(playlist[current].entry);
+    token++;
+    clearTimeout(idleTimer);
+    if (current >= 0 && player.getAttribute('src') && !player.ended) recordProgress(playlist[current].entry);
     player.pause(); player.removeAttribute('src'); player.load();
-    dlg.close();
+    hideMsg();
+    pl.hidden = true; pl.classList.remove('show', 'idle');
+    $('plRipL').classList.remove('on'); $('plRipR').classList.remove('on');
+    document.body.classList.remove('pl-open');
+    exitPlayerFs(); unlockScreen();
     refreshers.forEach(f => f());
     epRefreshers.forEach(f => f());
     if (state.view === 'movie') { updateMovieHeader(); loadReviews([state.movie.entry.key], {}); }
     else if (state.view === 'series') { updateSeriesHeader(); loadReviews(state.seriesKeys, state.seriesLabels); }
+    // Al salir de pantalla completa el navegador suelta el foco: se devuelve al botón que abrió el video.
+    const back = () => { const t = lastFocus && document.contains(lastFocus) && lastFocus.getClientRects().length ? lastFocus : $('resume'); focusEl(t); };
+    back();
+    setTimeout(() => { if (!playerOpen() && (!document.activeElement || document.activeElement === document.body)) back(); }, 150);
   }
 
-  $('close').onclick = closePlayer;
-  dlg.addEventListener('cancel', e => { e.preventDefault(); closePlayer(); });
-  $('prev').onclick = () => play(playlist, current - 1);
-  $('next').onclick = () => play(playlist, current + 1);
-  dlg.addEventListener('keydown', e => {
-    if (e.key === 'n' || e.key === 'N') play(playlist, current + 1);
-    else if (e.key === 'p' || e.key === 'P') play(playlist, current - 1);
-    else if (e.key === 'f' || e.key === 'F') { document.fullscreenElement === player ? document.exitFullscreen() : player.requestFullscreen?.(); }
-    else if (e.key === 'ArrowRight') { player.currentTime += 10; e.preventDefault(); }
-    else if (e.key === 'ArrowLeft') { player.currentTime -= 10; e.preventDefault(); }
-    else if (e.key === 'ArrowUp') { player.volume = Math.min(1, player.volume + 0.1); e.preventDefault(); }
-    else if (e.key === 'ArrowDown') { player.volume = Math.max(0, player.volume - 0.1); e.preventDefault(); }
-    else if (e.key === 'm' || e.key === 'M') { player.muted = !player.muted; }
-    else if (e.key === ' ' && document.activeElement !== player) { player.paused ? player.play() : player.pause(); e.preventDefault(); }
+  $('plBack').onclick = closePlayer;
+  $('plPlay').onclick = togglePlay;
+  $('plRew').onclick = () => skip(-10);
+  $('plFwd').onclick = () => skip(10);
+  $('plPrev').onclick = () => play(playlist, current - 1);
+  $('plNext').onclick = () => play(playlist, current + 1);
+  $('plMute').onclick = toggleMute;
+  $('plFs').onclick = togglePlayerFs;
+
+  document.addEventListener('keydown', e => {
+    if (!playerOpen() || e.ctrlKey || e.altKey || e.metaKey) return;
+    const k = e.key;
+    let handled = true;
+    if (k === ' ' || k === 'k' || k === 'K') togglePlay();
+    else if (k === 'ArrowRight') skip(10);
+    else if (k === 'ArrowLeft') skip(-10);
+    else if (k === 'ArrowUp') changeVol(0.1);
+    else if (k === 'ArrowDown') changeVol(-0.1);
+    else if (k === 'm' || k === 'M') toggleMute();
+    else if (k === 'f' || k === 'F') togglePlayerFs();
+    else if (k === 'n' || k === 'N') { if (current < playlist.length - 1) play(playlist, current + 1); }
+    else if (k === 'p' || k === 'P') { if (current > 0) play(playlist, current - 1); }
+    else if (k === 'Escape' || k === 'Backspace') closePlayer();
+    else if (/^[0-9]$/.test(k) && isFinite(player.duration)) { player.currentTime = player.duration * (+k / 10); showControls(); onTime(); }
+    else handled = false;
+    if (handled) e.preventDefault(); else showControls();
   });
 
   /* ---------- pestañas, búsqueda, actualizar ---------- */
@@ -795,6 +1010,7 @@
     info.textContent = 'Leyendo carpetas…';
     try { await Promise.all([loadLibrary(), loadUser()]); }
     catch (e) { info.textContent = e.message; return; }
+    pollConversion();
     if (state.view === 'series') {
       const again = state.lib.series.find(s => s.title === state.series.title);
       if (again) return showSeries(again, { season: state.season });
@@ -815,6 +1031,7 @@
   };
   fsButtons.forEach(b => { b.onclick = toggleFs; });
   document.addEventListener('fullscreenchange', () => {
+    pl.dataset.fs = String(fsEl() === pl);
     const on = !!document.fullscreenElement;
     fsButtons.forEach(b => {
       b.dataset.on = on;
@@ -873,7 +1090,7 @@
   document.addEventListener('keydown', e => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
     const modal = MODALS.find(d => d.open);
-    if (dlg.open && !modal) return;                 // el reproductor tiene sus propias teclas
+    if (playerOpen()) return;                       // el reproductor tiene sus propias teclas
     const a = document.activeElement, tag = a && a.tagName;
     const isTA = tag === 'TEXTAREA';
     const isIn = tag === 'INPUT' && (a.type === 'text' || a.type === 'search' || a.type === 'password');
