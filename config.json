@@ -1,7 +1,11 @@
 {
   "puerto": 3000,
   "claveAdmin": "admin",
+  "nombre": "Cine local",
+  "logo": "./logo.svg",
   "convertirVideos": true,
+  "reemplazarOriginal": true,
+  "reemplazarConPistasExtra": false,
   "optimizarCaratulas": true,
   "peliculas": ["./peliculas"],
   "series": ["./series"],

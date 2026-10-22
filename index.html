@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Cine local</title>
+<link rel="icon" href="/logo">
 <link rel="stylesheet" href="/css/styles.css">
 </head>
 <body>
@@ -15,7 +16,7 @@
     <svg class="i-compress" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/></svg>
   </button>
   <div class="pf-wrap">
-    <h1 class="brand">Cine local</h1>
+    <h1 class="brand brand-name">Cine local</h1>
     <h2>¿Quién está viendo?</h2>
     <div id="profileRow" class="profile-row" role="list"></div>
     <button id="pfManage" class="btn ghost manage" type="button" aria-pressed="false">Administrar perfiles</button>
@@ -24,7 +25,7 @@
 </section>
 
 <header id="appHeader" hidden>
-  <h1>Cine local</h1>
+  <h1 class="brand-name">Cine local</h1>
   <nav class="tabs" aria-label="Biblioteca">
     <button class="tab on" data-tab="movies" type="button">Películas <span id="cMovies" class="count"></span></button>
     <button class="tab" data-tab="series" type="button">Series <span id="cSeries" class="count"></span></button>
@@ -107,12 +108,14 @@
   <div id="plSpin" class="pl-spin" hidden></div>
   <div id="plMsg" class="pl-msg" hidden role="status">
     <div class="pl-ring"></div>
+    <img id="plLogoBig" class="pl-logo-big" alt="" hidden>
     <p id="plMsgText"></p>
     <div id="plMsgProg" class="pl-prog" hidden><i></i></div>
   </div>
 
   <div class="pl-top">
     <button id="plBack" class="plb md" type="button" aria-label="Volver" title="Volver (Esc)"><svg class="ic"><use href="#i-back"/></svg></button>
+    <img id="plLogo" class="pl-logo" alt="" hidden>
     <div class="pl-titles"><b id="plTitle"></b><span id="plSub"></span></div>
     <button id="plPrev" class="plnav" type="button" aria-label="Capítulo anterior" title="Anterior (P)"><svg class="ic"><use href="#i-prev"/></svg><span>Anterior</span></button>
     <button id="plNext" class="plnav next" type="button" aria-label="Capítulo siguiente" title="Siguiente (N)"><span>Siguiente</span><svg class="ic"><use href="#i-next"/></svg></button>

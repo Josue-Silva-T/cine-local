@@ -11,9 +11,54 @@
     lib: { movies: [], series: [], warnings: [], config: {} }, index: new Map(),
     me: null, profiles: [], hist: {}, mine: {}, summary: {},
     tab: 'movies', view: 'profiles', series: null, movie: null, season: null,
-    seriesList: [], seriesKeys: [], seriesLabels: {}, back: null, managing: false
+    seriesList: [], seriesKeys: [], seriesLabels: {}, managing: false, pending: null
   };
   let playlist = [], current = -1, refreshers = [], epRefreshers = [];
+
+  /* ---------- marca, modo TV y teclas del mando ---------- */
+  const IS_TV = /Tizen|Web0S|webOS|SMART-TV|SmartTV|BRAVIA|NetCast|HbbTV|VIDAA|Roku|CrKey|PhilipsTV|AFT[A-Z]|Android.*\bTV\b/i.test(navigator.userAgent) || /[?&]tv=1\b/.test(location.search);
+  if (IS_TV) document.documentElement.classList.add('tv');
+  // El anillo de foco solo se ve al navegar con teclado o mando, no al hacer clic.
+  document.addEventListener('keydown', () => document.body.classList.add('kbd'), true);
+  document.addEventListener('pointerdown', () => document.body.classList.remove('kbd'), true);
+
+  // Teclas de mando a distancia → acción. Cubre PC, Tizen (Samsung), webOS (LG) y Android TV.
+  const KEYMAP = {
+    ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down', Enter: 'ok',
+    Escape: 'back', Backspace: 'back', BrowserBack: 'back', GoBack: 'back', XF86Back: 'back',
+    MediaPlayPause: 'playpause', MediaPlay: 'play', MediaPause: 'pause', MediaStop: 'stop',
+    MediaRewind: 'rew', MediaFastForward: 'ffwd', MediaTrackNext: 'next', MediaTrackPrevious: 'prev'
+  };
+  const CODEMAP = {
+    37: 'left', 38: 'up', 39: 'right', 40: 'down', 13: 'ok', 8: 'back', 27: 'back',
+    10009: 'back', 461: 'back',                                   // Tizen y webOS: «Atrás»
+    179: 'playpause', 10252: 'playpause', 415: 'play', 19: 'pause', 413: 'stop',
+    412: 'rew', 417: 'ffwd', 10232: 'prev', 10233: 'next', 176: 'next', 177: 'prev'
+  };
+  const remoteKey = e => KEYMAP[e.key] || CODEMAP[e.keyCode] || null;
+  try {   // Tizen exige registrar las teclas multimedia
+    if (window.tizen && window.tizen.tvinputdevice) ['MediaPlayPause', 'MediaPlay', 'MediaPause', 'MediaStop', 'MediaRewind', 'MediaFastForward', 'MediaTrackPrevious', 'MediaTrackNext']
+      .forEach(k => { try { window.tizen.tvinputdevice.registerKey(k); } catch {} });
+  } catch {}
+
+  // Logo y nombre personalizables (config.json → "logo", "nombre").
+  const brand = { name: 'Cine local', page: '' };
+  function setTitle(t) { brand.page = t || ''; document.title = t ? `${t} · ${brand.name}` : brand.name; }
+  async function loadBranding() {
+    try {
+      const b = await api('/api/branding');
+      brand.name = b.name || brand.name;
+      const v = Date.now();
+      ['plLogo', 'plLogoBig'].forEach(id => {
+        const img = $(id);
+        img.onerror = () => { img.hidden = true; };
+        img.onload = () => { img.hidden = false; };
+        img.src = `${b.logo}?v=${v}`;
+      });
+      document.querySelectorAll('.brand-name').forEach(el => { el.textContent = brand.name; });
+    } catch {}
+    setTitle(brand.page);
+  }
 
   /* ---------- utilidades ---------- */
   const fmtSize = b => b > 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(0) + ' MB';
@@ -77,7 +122,7 @@
       if (!k || !k.startsWith(pre)) continue;
       try {
         const rec = JSON.parse(localStorage.getItem(k)), key = k.slice(pre.length), cur = state.hist[key];
-        if (rec && (!cur || rec.at > cur.at)) { state.hist[key] = rec; sendProgress(key, rec); }
+        if (rec && state.index.has(key) && (!cur || rec.at > cur.at)) { state.hist[key] = rec; sendProgress(key, rec); }
       } catch {}
     }
   }
@@ -116,10 +161,11 @@
     }
   }
 
-  function posterCard(it, { meta, entry, onClick }) {
+  function posterCard(it, { meta, entry, onClick, fk }) {
     const b = document.createElement('button');
     b.className = 'card'; b.type = 'button';
     b.dataset.title = it.title;
+    if (fk) b.dataset.fk = fk;
     b.addEventListener('click', onClick);
     b.innerHTML = `
       <div class="poster"><div class="play"><span><svg width="22" height="22" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></svg></span></div></div>
@@ -163,7 +209,7 @@
   }
 
   async function showProfiles(focusId) {
-    state.me = null; state.view = 'profiles';
+    state.view = 'profiles';
     appHeader.hidden = true; appMain.hidden = true; profilesEl.hidden = false;
     const row = $('profileRow'), msg = $('pfMsg');
     msg.textContent = '';
@@ -202,15 +248,17 @@
     me.append(avatarEl(p, 'sm'));
     const n = document.createElement('span'); n.className = 'me-name'; n.textContent = p.name; me.append(n);
 
-    state.tab = 'movies'; state.series = null; state.movie = null; state.view = 'home';
+    state.series = null; state.movie = null; state.view = 'home';
     detail.hidden = true; histEl.hidden = true; grid.innerHTML = '';
     info.textContent = 'Cargando…';
-    try { await Promise.all([loadUser(), loadLibrary()]); }
+    try { await Promise.all([loadUser(), loadLibrary()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
     pollConversion();
-    showTab();
-    const first = grid.firstElementChild;
-    focusEl(first || document.querySelector('.tab.on'));
+    const target = state.pending || '/';          // si llegó por un enlace directo, se abre ese contenido
+    state.pending = null;
+    const kind = parseRoute(...(u => [u.pathname, u.search])(new URL(target, location.origin))).name;
+    if (kind === 'watch' || kind === 'episode') go(parentUrl(target));   // primero la ficha, para que «Volver» tenga adónde ir
+    go(target);
   }
 
   /* nuevo perfil / editar perfil */
@@ -306,6 +354,7 @@
     if (!password) { err.textContent = 'Escribe la contraseña de administrador.'; err.hidden = false; $('delPass').focus(); return; }
     try {
       await api('/api/profiles/delete', { id: delTarget.id, password });
+      if (state.me && state.me.id === delTarget.id) state.me = null;
       try { if (localStorage.getItem('cl:last') === delTarget.id) localStorage.removeItem('cl:last'); } catch {}
       delDlg.close();
       await showProfiles();
@@ -321,7 +370,6 @@
     state.hist = h.history || {};
     state.mine = h.ratings || {};
     state.summary = s;
-    mergeLocalProgress();
   }
 
   function buildIndex() {
@@ -348,18 +396,23 @@
   }
 
   /* ---------- conversión en segundo plano ---------- */
-  let convTimer = 0;
+  let convTimer = 0, lastReplaced = null;
   async function pollConversion() {
     clearTimeout(convTimer);
     let c;
     try { c = await api('/api/conversion'); } catch { return; }
     const el = $('conv');
+    if (lastReplaced === null) lastReplaced = c.replaced;
     if (c.active) {
+      const cur = c.current;
       el.hidden = false;
-      el.textContent = `Optimizando videos para reproducirlos en cualquier dispositivo… ${c.done} de ${c.total}` +
-        (c.current ? ` · ${c.current.name} (${Math.round(c.current.progress * 100)}%)` : '');
+      el.textContent = (cur && cur.phase === 'replacing' ? 'Sustituyendo el original por el MP4…' : 'Convirtiendo videos a MP4 (H.264 + AAC)…') +
+        ` ${Math.min(c.done, c.total)} de ${c.total}` + (cur ? ` · ${cur.name}` + (cur.phase === 'replacing' ? '' : ` (${Math.round(cur.progress * 100)}%)`) : '');
       convTimer = setTimeout(pollConversion, 3000);
-    } else el.hidden = true;
+    } else {
+      el.hidden = true;
+      if (c.replaced !== lastReplaced && !playerOpen()) { lastReplaced = c.replaced; refreshAll(); }   // los archivos cambiaron de nombre
+    }
   }
 
   /* ---------- vistas ---------- */
@@ -371,9 +424,7 @@
   }
 
   const setTabs = () => document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === state.tab));
-  const showTab = () => (state.tab === 'history' ? showHistory() : showHome());
-
-  function showHome(focusTitle) {
+  function showHome() {
     state.view = 'home'; state.series = null; state.movie = null;
     detail.hidden = true; histEl.hidden = true;
     q.hidden = false;
@@ -403,7 +454,7 @@
         const r = ratingOf([m.entry.key]);
         grid.append(posterCard(m, {
           meta: (r.n ? `★ ${r.avg.toFixed(1)} · ` : '') + fmtSize(m.entry.size), entry: m.entry,
-          onClick: () => showMovie(m)
+          fk: 'm:' + m.id, onClick: () => go(movieUrl(m))
         }));
       });
     } else {
@@ -413,13 +464,9 @@
         const r = ratingOf(seriesKeysOf(s));
         grid.append(posterCard(s, {
           meta: (r.n ? `★ ${r.avg.toFixed(1)} · ` : '') + (s.seasons.length > 1 ? plural(s.seasons.length, 'temp.', 'temp.') + ' · ' : '') + plural(countEps(s), 'cap.', 'caps.'),
-          onClick: () => showSeries(s)
+          fk: 's:' + s.id, onClick: () => go(showUrl(s))
         }));
       });
-    }
-    if (focusTitle) {
-      const el = [...grid.children].find(c => c.dataset.title === focusTitle);
-      if (el) focusEl(el);
     }
   }
 
@@ -437,7 +484,7 @@
       const ix = state.index.get(k);
       if (!ix) return;
       const h = state.hist[k], r = state.mine[k];
-      rows.push({ ix, h, r, at: Math.max(h ? h.at : 0, r ? r.at : 0) });
+      rows.push({ ix, h, r, k, at: Math.max(h ? h.at : 0, r ? r.at : 0) });
     });
     rows.sort((a, b) => b.at - a.at);
     info.textContent = rows.length ? `${state.me.name} · ${plural(rows.length, 'título', 'títulos')}` : '';
@@ -447,9 +494,9 @@
       histEl.append(p);
       return;
     }
-    rows.forEach(({ ix, h, r, at }) => {
+    rows.forEach(({ ix, h, r, k, at }) => {
       const b = document.createElement('button');
-      b.type = 'button'; b.className = 'hrow';
+      b.type = 'button'; b.className = 'hrow'; b.dataset.fk = 'h:' + k;
       b.innerHTML = '<div class="poster"></div><div class="hinfo"><b></b><span class="sub"></span><span class="line"></span><span class="when"></span></div>';
       fillPoster(b.querySelector('.poster'), ix.poster);
       b.querySelector('b').textContent = ix.title;
@@ -461,19 +508,17 @@
         const st = document.createElement('span'); st.className = 'st'; st.textContent = starStr(r.stars); line.append(st);
       }
       b.querySelector('.when').textContent = fmtDate(at);
-      b.onclick = () => (ix.kind === 'movie' ? showMovie(ix.movie, 'history') : showSeries(ix.series, { from: 'history', season: ix.season }));
+      b.onclick = () => go(ix.kind === 'movie' ? movieUrl(ix.movie) : showUrl(ix.series, ix.season));
       histEl.append(b);
     });
     focusEl(histEl.firstElementChild);
   }
 
   /* ---------- detalle (película / serie) ---------- */
-  function setBack(label, fn) { $('back').textContent = '‹ ' + label; state.back = fn; }
-  const goBack = () => { if (state.back) state.back(); };
-
   function showDetailShell(kind) {
     q.hidden = true; empty.hidden = true; grid.hidden = true; histEl.hidden = true; detail.hidden = false;
     info.textContent = '';
+    $('back').textContent = '‹ Volver';
     $('rateBtn').hidden = kind !== 'movie';
     if (kind === 'movie') { $('chips').hidden = true; $('episodes').hidden = true; }
     else $('episodes').hidden = false;
@@ -487,16 +532,14 @@
     $('sRating').textContent = ratingText([e.key]);
     const r = $('resume');
     r.textContent = p && p.t > 5 ? `Continuar viendo · ${p.pct || 0}%` : p && p.pct >= 95 ? 'Ver de nuevo' : 'Reproducir';
-    r.onclick = () => play([{ entry: e, title: m.title, main: m.title, sub: '' }], 0);
+    r.onclick = () => go(watchUrl(m));
     const rb = $('rateBtn');
     rb.textContent = mine ? `${starStr(mine.stars)}  Editar mi reseña` : '✩ Calificar';
     rb.onclick = () => openRate(e, m.title);
   }
 
-  function showMovie(m, from) {
+  function showMovie(m) {
     state.view = 'movie'; state.movie = m; state.series = null;
-    if (from === 'history') setBack('Mi historial', showHistory);
-    else setBack('Películas', () => { state.tab = 'movies'; showHome(m.title); });
     showDetailShell('movie');
     $('dPoster').innerHTML = '';
     fillPoster($('dPoster'), m);
@@ -511,7 +554,8 @@
     s.seasons.forEach(se => se.episodes.forEach((e, i) => list.push({
       entry: e.entry, season: se.n, n: e.n ?? i + 1, epTitle: e.title,
       title: `${s.title} · ${code(se.n, e.n ?? i + 1)}${e.title ? ' · ' + e.title : ''}`,
-      main: s.title, sub: code(se.n, e.n ?? i + 1) + (e.title ? ' · ' + e.title : '')
+      main: s.title, sub: code(se.n, e.n ?? i + 1) + (e.title ? ' · ' + e.title : ''),
+      url: '/show/' + encodeURIComponent(s.id) + '/ep/' + encodeURIComponent(code(se.n, e.n ?? i + 1))
     })));
     return list;
   }
@@ -530,13 +574,11 @@
     $('sRating').textContent = ratingText(state.seriesKeys);
     const r = resumeInfo(list), it = list[r.idx];
     $('resume').textContent = `${r.label} · ${code(it.season, it.n)}`;
-    $('resume').onclick = () => play(list, r.idx);
+    $('resume').onclick = () => go(list[r.idx].url);
   }
 
   function showSeries(s, opts = {}) {
     state.view = 'series'; state.series = s; state.movie = null;
-    if (opts.from === 'history') setBack('Mi historial', showHistory);
-    else setBack('Series', () => { state.tab = 'series'; showHome(s.title); });
     showDetailShell('series');
 
     $('dPoster').innerHTML = '';
@@ -564,7 +606,7 @@
       const c = document.createElement('button');
       c.type = 'button'; c.className = 'chip' + (se.n === state.season ? ' on' : '');
       c.textContent = 'Temporada ' + se.n;
-      c.onclick = () => { state.season = se.n; renderSeasons(s, list); focusEl(chips.querySelector('.chip.on')); };
+      c.onclick = () => { state.season = se.n; history.replaceState(history.state, '', showUrl(s, se.n)); renderSeasons(s, list); focusEl(chips.querySelector('.chip.on')); };
       chips.append(c);
     });
 
@@ -587,7 +629,8 @@
       b.querySelector('small').textContent = e.title;
       b.querySelector('small').hidden = !e.title;
       b.querySelector('.sz').textContent = fmtSize(e.entry.size);
-      b.onclick = () => play(list, idx);
+      b.dataset.fk = 'e:' + code(season.n, num);
+      b.onclick = () => go(list[idx].url);
       const refresh = () => {
         b.querySelector('.bar')?.remove();
         const w = barPct(e.entry);
@@ -598,7 +641,7 @@
 
       const rb = document.createElement('button');
       rb.type = 'button'; rb.className = 'rate-btn' + (mine ? ' on' : '');
-      rb.dataset.key = e.entry.key;
+      rb.dataset.key = e.entry.key; rb.dataset.fk = 'r:' + code(season.n, num);
       rb.textContent = mine ? starStr(mine.stars) : '✩ Calificar';
       rb.title = mine ? 'Editar mi reseña' : 'Calificar este capítulo';
       rb.onclick = () => openRate(e.entry, `${s.title} · ${code(season.n, num)}${e.title ? ' · ' + e.title : ''}`);
@@ -746,12 +789,14 @@
   function lockLandscape() {
     try { if (matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(() => {}); } catch {}
   }
+  let pendingFs = false;                              // un enlace directo no permite pantalla completa sin un gesto del usuario
   function enterFs() {
     if (fsEl() === pl) return;
     const f = pl.requestFullscreen || pl.webkitRequestFullscreen;
     if (!f) return;                                   // p. ej. iPhone: el reproductor ya ocupa toda la pantalla
-    try { const p = f.call(pl); if (p && p.then) p.then(lockLandscape).catch(() => {}); } catch {}
+    try { const p = f.call(pl); if (p && p.then) p.then(() => { pendingFs = false; lockLandscape(); }).catch(() => { pendingFs = true; }); } catch { pendingFs = true; }
   }
+  ['pointerdown', 'keydown'].forEach(ev => document.addEventListener(ev, () => { if (pendingFs && playerOpen()) { pendingFs = false; enterFs(); } }, true));
   function exitPlayerFs() {
     if (fsEl() === pl) { try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch {} }
     try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch {}
@@ -890,6 +935,8 @@
     playlist = list; current = idx;
     const my = ++token;
     const it = list[idx];
+    if (it.url && it.url !== curUrl()) history.replaceState(history.state, '', it.url);      // cada video tiene su URL
+    setTitle(it.main ? it.main + (it.sub ? ' · ' + it.sub : '') : it.title);
     if (!wasOpen) {                                  // se abre en pantalla completa (dentro del gesto del usuario)
       lastFocus = document.activeElement;
       pl.hidden = false;
@@ -953,7 +1000,8 @@
   window.addEventListener('beforeunload', flushProgress);
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushProgress(); });
 
-  function closePlayer() {
+  // Cierra el reproductor solo (la ruta ya no es de reproducción).
+  function hidePlayer() {
     token++;
     clearTimeout(idleTimer);
     if (current >= 0 && player.getAttribute('src') && !player.ended) recordProgress(playlist[current].entry);
@@ -971,7 +1019,11 @@
     const back = () => { const t = lastFocus && document.contains(lastFocus) && lastFocus.getClientRects().length ? lastFocus : $('resume'); focusEl(t); };
     back();
     setTimeout(() => { if (!playerOpen() && (!document.activeElement || document.activeElement === document.body)) back(); }, 150);
+    pollConversion();
   }
+
+  // «Volver»: retrocede en el historial del navegador; en un enlace directo, va a la ficha del contenido.
+  function closePlayer() { if (playerOpen()) goBack(); }
 
   $('plBack').onclick = closePlayer;
   $('plPlay').onclick = togglePlay;
@@ -984,42 +1036,52 @@
 
   document.addEventListener('keydown', e => {
     if (!playerOpen() || e.ctrlKey || e.altKey || e.metaKey) return;
-    const k = e.key;
+    const k = e.key, rk = remoteKey(e), ae = document.activeElement;
+    const onCtl = pl.contains(ae) && ae.matches('button, input[type=range]');
+    const visible = pl.classList.contains('show') && !msgVisible();
     let handled = true;
-    if (k === ' ' || k === 'k' || k === 'K') togglePlay();
-    else if (k === 'ArrowRight') skip(10);
-    else if (k === 'ArrowLeft') skip(-10);
-    else if (k === 'ArrowUp') changeVol(0.1);
-    else if (k === 'ArrowDown') changeVol(-0.1);
+    if (IS_TV && (rk === 'left' || rk === 'right' || rk === 'up' || rk === 'down')) {
+      if (!visible || !onCtl) {                         // controles ocultos: ←/→ saltan 10 s, ↑/↓ los muestran
+        if (rk === 'left') skip(-10); else if (rk === 'right') skip(10);
+        else { showControls(); focusEl($('plPlay')); }
+      } else if (ae.id === 'plSeek' && (rk === 'left' || rk === 'right')) skip(rk === 'left' ? -10 : 10);
+      else move(rk);                                    // cruceta: se mueve entre los botones
+    }
+    else if (rk === 'playpause' || k === ' ' || k === 'k' || k === 'K') togglePlay();
+    else if (rk === 'play') { player.play().catch(() => {}); showControls(); }
+    else if (rk === 'pause') { player.pause(); showControls(); }
+    else if (rk === 'ok') { if (onCtl && ae.tagName === 'BUTTON') handled = false; else togglePlay(); }   // OK sobre un botón lo activa
+    else if (rk === 'right' || rk === 'ffwd') skip(10);
+    else if (rk === 'left' || rk === 'rew') skip(-10);
+    else if (rk === 'up') changeVol(0.1);
+    else if (rk === 'down') changeVol(-0.1);
     else if (k === 'm' || k === 'M') toggleMute();
     else if (k === 'f' || k === 'F') togglePlayerFs();
-    else if (k === 'n' || k === 'N') { if (current < playlist.length - 1) play(playlist, current + 1); }
-    else if (k === 'p' || k === 'P') { if (current > 0) play(playlist, current - 1); }
-    else if (k === 'Escape' || k === 'Backspace') closePlayer();
+    else if (rk === 'next' || k === 'n' || k === 'N') { if (current < playlist.length - 1) play(playlist, current + 1); }
+    else if (rk === 'prev' || k === 'p' || k === 'P') { if (current > 0) play(playlist, current - 1); }
+    else if (rk === 'back' || rk === 'stop') closePlayer();
     else if (/^[0-9]$/.test(k) && isFinite(player.duration)) { player.currentTime = player.duration * (+k / 10); showControls(); onTime(); }
     else handled = false;
     if (handled) e.preventDefault(); else showControls();
   });
 
   /* ---------- pestañas, búsqueda, actualizar ---------- */
-  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => { state.tab = t.dataset.tab; showTab(); }));
+  const TAB_URL = { movies: '/', series: '/series', history: '/historial' };
+  document.querySelectorAll('.tab').forEach(t => { t.dataset.fk = 't:' + t.dataset.tab; t.addEventListener('click', () => go(TAB_URL[t.dataset.tab])); });
   q.addEventListener('input', showHome);
-  $('back').onclick = goBack;
-  $('me').onclick = () => { state.managing = false; showProfiles(); };
-  $('rescan').onclick = async () => {
+  $('back').onclick = () => goBack();
+  $('me').onclick = () => { state.managing = false; go('/perfiles'); };
+
+  // Vuelve a leer carpetas y datos, y redibuja la pantalla actual (los ids de las URL son estables).
+  async function refreshAll() {
     info.textContent = 'Leyendo carpetas…';
-    try { await Promise.all([loadLibrary(), loadUser()]); }
+    try { await Promise.all([loadLibrary(), loadUser()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
     pollConversion();
-    if (state.view === 'series') {
-      const again = state.lib.series.find(s => s.title === state.series.title);
-      if (again) return showSeries(again, { season: state.season });
-    } else if (state.view === 'movie') {
-      const again = state.lib.movies.find(m => m.entry.key === state.movie.entry.key);
-      if (again) return showMovie(again);
-    }
-    showTab();
-  };
+    state.view = ''; state.movie = null; state.series = null;
+    route();
+  }
+  $('rescan').onclick = refreshAll;
 
   /* ---------- pantalla completa ---------- */
   const root = document.documentElement;
@@ -1045,6 +1107,7 @@
   const shown = el => !el.closest('[hidden]') && el.getClientRects().length;
 
   function navItems() {
+    if (playerOpen()) return [...pl.querySelectorAll('button, input[type=range]')].filter(el => !el.disabled && shown(el));
     const modal = MODALS.find(d => d.open);
     if (modal) return [...modal.querySelectorAll('button, textarea, input:not([type=file])')].filter(shown);
     if (!profilesEl.hidden) return [...profilesEl.querySelectorAll('button')].filter(shown);
@@ -1086,15 +1149,16 @@
     focusEl(best);
   }
 
-  const DIRS = { ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down' };
+  const DIRS = ['left', 'right', 'up', 'down'];
   document.addEventListener('keydown', e => {
     if (e.altKey || e.ctrlKey || e.metaKey) return;
-    const modal = MODALS.find(d => d.open);
     if (playerOpen()) return;                       // el reproductor tiene sus propias teclas
+    const modal = MODALS.find(d => d.open);
     const a = document.activeElement, tag = a && a.tagName;
     const isTA = tag === 'TEXTAREA';
     const isIn = tag === 'INPUT' && (a.type === 'text' || a.type === 'search' || a.type === 'password');
-    const dir = DIRS[e.key];
+    const rk = remoteKey(e);
+    const dir = DIRS.includes(rk) ? rk : null;
 
     if (dir) {
       if (isIn && dir === 'left' && !(a.selectionStart === 0 && a.selectionEnd === 0)) return;
@@ -1116,19 +1180,129 @@
 
     if (modal) {
       if (modal === rateDlg && !isTA && /^[1-5]$/.test(e.key)) setStars(+e.key);
+      else if (rk === 'back' && e.key !== 'Escape' && e.key !== 'Backspace') modal.close();   // botón «Atrás» del mando
       return;                                       // Esc cierra el diálogo por sí solo
     }
     if (isTA || isIn) return;
 
-    if (e.key === 'Escape' && state.view === 'profiles' && state.managing) {
-      setManaging(false);
-    } else if (e.key === 'Escape' || e.key === 'Backspace') {
-      if (state.view === 'movie' || state.view === 'series') { e.preventDefault(); goBack(); }
+    if (rk === 'back') {
+      if (state.view === 'profiles') { if (state.managing) setManaging(false); }
+      else if (state.view === 'movie' || state.view === 'series') { e.preventDefault(); goBack(); }
+      else if (state.view === 'history' || state.tab !== 'movies' || IS_TV) { e.preventDefault(); goBack('/'); }
     } else if (e.key === 'f' || e.key === 'F') {
       toggleFs();
     }
   });
 
+  /* ---------- rutas con URL propia e historial del navegador ----------
+     /                      películas              /movie/:id         ficha de una película
+     /series                series                 /watch?v=:id       reproduciendo una película
+     /historial             mi historial           /show/:id[?s=N]    ficha de una serie
+     /perfiles              elegir perfil          /show/:id/ep/T1C4  reproduciendo un capítulo        */
+  const focusMem = new Map();                       // URL -> elemento que tenía el foco al salir
+  const curUrl = () => location.pathname + location.search;
+  const depth = () => (history.state && history.state.idx) || 0;
+  const activeFk = () => { const a = document.activeElement; return (a && a.dataset && a.dataset.fk) || null; };
+  const focusFk = fk => {
+    if (!fk) return false;
+    const el = [...document.querySelectorAll('[data-fk]')].find(x => x.dataset.fk === fk && x.getClientRects().length);
+    if (el) focusEl(el);
+    return !!el;
+  };
+
+  const movieUrl = m => '/movie/' + encodeURIComponent(m.id);
+  const watchUrl = m => '/watch?v=' + encodeURIComponent(m.id);
+  const showUrl = (s, season) => '/show/' + encodeURIComponent(s.id) + (season ? '?s=' + season : '');
+  const findMovie = id => state.lib.movies.find(m => m.id === id);
+  const findSeries = id => state.lib.series.find(s => s.id === id);
+
+  function parseRoute(pathname = location.pathname, search = location.search) {
+    const p = pathname.replace(/\/+$/, '') || '/', q = new URLSearchParams(search);
+    const dec = v => { try { return decodeURIComponent(v); } catch { return v; } };
+    let m;
+    if (p === '/') return { name: 'home', tab: 'movies' };
+    if (p === '/series') return { name: 'home', tab: 'series' };
+    if (p === '/historial') return { name: 'history' };
+    if (p === '/perfiles') return { name: 'profiles' };
+    if (p === '/watch') return { name: 'watch', id: q.get('v') || '' };
+    if ((m = p.match(/^\/movie\/([^/]+)$/))) return { name: 'movie', id: dec(m[1]) };
+    if ((m = p.match(/^\/show\/([^/]+)\/ep\/([^/]+)$/))) return { name: 'episode', sid: dec(m[1]), code: dec(m[2]) };
+    if ((m = p.match(/^\/show\/([^/]+)$/))) return { name: 'show', sid: dec(m[1]), season: q.get('s') };
+    return { name: 'notfound' };
+  }
+  const parentUrl = url => {
+    const u = url ? new URL(url, location.origin) : location;
+    const r = parseRoute(u.pathname, u.search);
+    return r.name === 'watch' ? '/movie/' + encodeURIComponent(r.id) : r.name === 'episode' ? '/show/' + encodeURIComponent(r.sid) : r.name === 'show' ? '/series' : '/';
+  };
+
+  function go(url, { replace = false } = {}) {
+    if (url !== curUrl()) focusMem.set(curUrl(), activeFk());
+    if (replace) history.replaceState({ idx: depth() }, '', url);
+    else if (url !== curUrl()) history.pushState({ idx: depth() + 1 }, '', url);
+    route();
+  }
+
+  // Atrás: vuelve a la URL anterior del historial; si es la primera entrada (enlace directo), sube un nivel.
+  function goBack(fallback) {
+    if (depth() > 0) history.back();
+    else go(typeof fallback === 'string' ? fallback : parentUrl(), { replace: true });
+  }
+
+  function notFound() {
+    go('/', { replace: true });
+    info.textContent = 'No se encontró el contenido de ese enlace.';
+  }
+
+  function route() {
+    MODALS.forEach(d => { if (d.open) d.close(); });
+    const r = parseRoute();
+    if (r.name === 'profiles') { if (playerOpen()) hidePlayer(); setTitle('Perfiles'); showProfiles(); return; }
+    if (!state.me) {                                 // enlace directo sin perfil: se elige y luego se abre
+      state.pending = curUrl();
+      history.replaceState({ idx: 0 }, '', '/perfiles');
+      setTitle('Perfiles');
+      showProfiles();
+      return;
+    }
+    profilesEl.hidden = true; appHeader.hidden = false; appMain.hidden = false;   // vuelve la interfaz (p. ej. «Atrás» desde /perfiles)
+    const playing = r.name === 'watch' || r.name === 'episode';
+    if (!playing && playerOpen()) hidePlayer();
+
+    if (r.name === 'home') { state.tab = r.tab; setTitle(r.tab === 'series' ? 'Series' : 'Películas'); showHome(); }
+    else if (r.name === 'history') { setTitle('Mi historial'); showHistory(); }
+    else if (r.name === 'movie' || r.name === 'watch') {
+      const m = findMovie(r.id);
+      if (!m) return notFound();
+      if (!(state.view === 'movie' && state.movie && state.movie.id === m.id)) showMovie(m);
+      if (r.name === 'movie') setTitle(m.title);
+      else play([{ entry: m.entry, title: m.title, main: m.title, sub: '', url: watchUrl(m) }], 0);
+    }
+    else if (r.name === 'show' || r.name === 'episode') {
+      const s = findSeries(r.sid);
+      if (!s) return notFound();
+      const season = r.season ? parseInt(r.season, 10) : null;
+      if (!(state.view === 'series' && state.series && state.series.id === s.id)) showSeries(s, { season });
+      else if (season && season !== state.season && s.seasons.some(x => x.n === season)) { state.season = season; renderSeasons(s, state.seriesList); }
+      if (r.name === 'show') setTitle(s.title);
+      else {
+        const idx = state.seriesList.findIndex(x => ('T' + x.season + 'C' + x.n) === r.code);
+        if (idx < 0) return notFound();
+        play(state.seriesList, idx);
+      }
+    }
+    else return notFound();
+
+    if (!playing && !focusFk(focusMem.get(curUrl())) && state.view === 'home') {   // al volver, el foco regresa donde estaba
+      const ae = document.activeElement;
+      if (!(ae && ae.classList && ae.classList.contains('tab'))) focusEl(grid.firstElementChild || document.querySelector('.tab.on'));   // si no, a la primera carátula
+    }
+  }
+
   /* ---------- inicio ---------- */
-  showProfiles();
+  window.addEventListener('popstate', route);
+  history.scrollRestoration = 'manual';
+  if (!history.state) history.replaceState({ idx: 0 }, '', curUrl());
+  loadBranding();
+  route();
 })();
