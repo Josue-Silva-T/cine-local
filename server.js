@@ -153,10 +153,13 @@ async function makeEntry(kind, idx, f) {
   };
 }
 
+const logged = new Set();
+const logOnce = msg => { const key = msg.replace(/0x[0-9a-f]+/gi, ''); if (!logged.has(key)) { logged.add(key); console.log('  Aviso: ' + msg.replace(/\[[^\]]*\]\s*/g, '')); } };
+
 async function scan() {
   const { cfg, error } = loadConfig();
   ensureLocalDirs(cfg);
-  const warnings = [...(error ? [error] : []), ...replaceNotes];
+  const warnings = error ? [error] : [];      // se imprimen en la consola del servidor, no en la página
 
   // Solo rutas que existen; el índice se conserva para armar las URL.
   const existing = async kind => {
@@ -258,7 +261,8 @@ async function scan() {
   const usedS = new Set();
   series.forEach(s => { s.id = uniqueId(slug(s.folder), usedS); });
 
-  return { movies, series, warnings, config: { peliculas: cfg.peliculas, series: cfg.series, caratulas: cfg.caratulas } };
+  warnings.forEach(logOnce);
+  return { movies, series, warnings: [], config: { peliculas: cfg.peliculas, series: cfg.series, caratulas: cfg.caratulas } };
 }
 
 /* ---------- Resolver archivos de las rutas configuradas ---------- */
@@ -450,12 +454,14 @@ function startJob(job) {
   const part = job.out + '.part';
   const args = buildArgs(job, part);
   const ff = job.bg && NICE ? spawn('nice', ['-n', '10', 'ffmpeg', ...args]) : spawn('ffmpeg', args);
+  console.log(`  Convirtiendo "${job.name}"${job.bg ? ' (segundo plano)' : ''}…`);
   let errText = '', finished = false;
   const finish = (ok, error) => {
     if (finished) return;
     finished = true;
     if (job.bg) bgRunning--;
-    if (!ok) { job.state = 'error'; job.error = error; stats.failed++; fs.unlink(part, () => {}); if (job.bg) pumpBg(); return; }
+    if (!ok) { job.state = 'error'; job.error = error; stats.failed++; fs.unlink(part, () => {}); console.log(`  Error al convertir "${job.name}": ${error}`); if (job.bg) pumpBg(); return; }
+    console.log(`  Convertido: "${job.name}"`);
     job.progress = 0.99;
     if (job.bg) pumpBg();
     settle(job);
@@ -464,6 +470,8 @@ function startJob(job) {
     const line = d.toString().split('\n').reverse().find(l => l.startsWith('out_time_us=') || l.startsWith('out_time_ms=')) || '';
     const m = /=(\d+)/.exec(line);
     if (m && job.duration) job.progress = Math.min(parseInt(m[1], 10) / 1e6 / job.duration, 0.98);
+    const step = Math.floor(job.progress * 5);
+    if (step > (job.logStep || 0)) { job.logStep = step; console.log(`  Convirtiendo "${job.name}": ${step * 20} %`); }
   });
   ff.stderr.on('data', d => { errText += d.toString(); });
   ff.on('error', e => finish(false, e.message));
@@ -837,6 +845,12 @@ const server = http.createServer(async (req, res) => {
       const lib = await scan();
       enqueueLibrary(lib).catch(() => {});
       return json(res, 200, lib);
+    }
+
+    if (p === '/api/log' && req.method === 'POST') {
+      const b = await readBody(req, 4e3);
+      console.log('  [navegador] ' + String(b.msg || '').replace(/[\u0000-\u001f]/g, ' ').slice(0, 300));
+      return json(res, 200, { ok: true });
     }
 
     if (p.startsWith('/api/') && await profileApi(req, res, p, url)) return;

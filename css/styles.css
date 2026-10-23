@@ -367,3 +367,7 @@ html.tv .plb.md{--sz:60px}
 html.tv .plnav{height:56px;font-size:1.1rem}
 html.tv .pl-range{height:40px}
 html.tv .pl-vol{display:block}
+
+/* ---------- Estado del reproductor sin texto: solo indicador de carga o icono de error ---------- */
+.pl-warn-ic{display:none;width:84px;height:84px;color:#ffb4bf}
+.pl-msg.error .pl-warn-ic{display:block}

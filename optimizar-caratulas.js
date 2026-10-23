@@ -48,7 +48,7 @@ async function convertToWebp(src, tmp) {
   for (const [cmd, args] of attempts) {
     const r = await run(cmd, args);
     if (r.ok && fs.existsSync(tmp) && fs.statSync(tmp).size > 0 && isWebp(tmp)) return null;
-    if (!last && !r.missing && r.error) last = r.error.split('\n').pop();
+    if (!last && !r.missing && r.error) last = r.error.split('\n').pop().replace(/^\[[^\]]*\]\s*/, '');
     fs.rmSync(tmp, { force: true });
   }
   return last || 'No hay ffmpeg, cwebp ni ImageMagick instalados';

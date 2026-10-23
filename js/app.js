@@ -1,7 +1,7 @@
 (() => {
   'use strict';
   const $ = id => document.getElementById(id);
-  const grid = $('grid'), info = $('info'), warn = $('warn'), empty = $('empty'), detail = $('detail'), histEl = $('history'), q = $('q');
+  const grid = $('grid'), info = $('info'), empty = $('empty'), detail = $('detail'), histEl = $('history'), q = $('q');
   const pl = $('pl'), player = $('player');
   const profilesEl = $('profiles'), appHeader = $('appHeader'), appMain = $('appMain');
   const rateDlg = $('rateDlg'), newDlg = $('newDlg'), delDlg = $('delDlg');
@@ -42,6 +42,8 @@
   } catch {}
 
   // Logo y nombre personalizables (config.json → "logo", "nombre").
+  // Los mensajes de diagnóstico no se muestran en pantalla: se envían a la consola del servidor.
+  const reportLog = msg => { try { fetch('/api/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msg: String(msg) }), keepalive: true }).catch(() => {}); } catch {} };
   const brand = { name: 'Cine local', page: '' };
   function setTitle(t) { brand.page = t || ''; document.title = t ? `${t} · ${brand.name}` : brand.name; }
   async function loadBranding() {
@@ -250,7 +252,7 @@
 
     state.series = null; state.movie = null; state.view = 'home';
     detail.hidden = true; histEl.hidden = true; grid.innerHTML = '';
-    info.textContent = 'Cargando…';
+    info.textContent = '';
     try { await Promise.all([loadUser(), loadLibrary()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
     pollConversion();
@@ -396,33 +398,18 @@
   }
 
   /* ---------- conversión en segundo plano ---------- */
+  // La conversión se informa en la consola del servidor. Aquí solo se detecta que hubo reemplazos para recargar la lista.
   let convTimer = 0, lastReplaced = null;
   async function pollConversion() {
     clearTimeout(convTimer);
     let c;
     try { c = await api('/api/conversion'); } catch { return; }
-    const el = $('conv');
     if (lastReplaced === null) lastReplaced = c.replaced;
-    if (c.active) {
-      const cur = c.current;
-      el.hidden = false;
-      el.textContent = (cur && cur.phase === 'replacing' ? 'Sustituyendo el original por el MP4…' : 'Convirtiendo videos a MP4 (H.264 + AAC)…') +
-        ` ${Math.min(c.done, c.total)} de ${c.total}` + (cur ? ` · ${cur.name}` + (cur.phase === 'replacing' ? '' : ` (${Math.round(cur.progress * 100)}%)`) : '');
-      convTimer = setTimeout(pollConversion, 3000);
-    } else {
-      el.hidden = true;
-      if (c.replaced !== lastReplaced && !playerOpen()) { lastReplaced = c.replaced; refreshAll(); }   // los archivos cambiaron de nombre
-    }
+    if (c.active) convTimer = setTimeout(pollConversion, 3000);
+    else if (c.replaced !== lastReplaced && !playerOpen()) { lastReplaced = c.replaced; refreshAll(); }   // los archivos cambiaron de nombre
   }
 
   /* ---------- vistas ---------- */
-  function renderWarnings() {
-    const w = state.lib.warnings || [];
-    warn.hidden = !w.length;
-    warn.innerHTML = '';
-    w.forEach(t => { const p = document.createElement('p'); p.textContent = t; warn.append(p); });
-  }
-
   const setTabs = () => document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === state.tab));
   function showHome() {
     state.view = 'home'; state.series = null; state.movie = null;
@@ -434,7 +421,6 @@
     $('cMovies').textContent = movies.length;
     $('cSeries').textContent = series.length;
     setTabs();
-    renderWarnings();
 
     const total = movies.length + series.length;
     empty.hidden = total > 0;
@@ -477,7 +463,6 @@
     histEl.innerHTML = '';
     refreshers = []; epRefreshers = [];
     setTabs();
-    renderWarnings();
 
     const rows = [];
     new Set([...Object.keys(state.hist), ...Object.keys(state.mine)]).forEach(k => {
@@ -776,7 +761,8 @@
   function showMsg(text, { error = false, progress = null } = {}) {
     $('plMsg').hidden = false;
     $('plMsg').classList.toggle('error', error);
-    $('plMsgText').textContent = text;
+    if (error && text) reportLog('Reproductor: ' + text);              // el detalle va a la consola del servidor
+    $('plMsg').setAttribute('aria-label', error ? 'Error de reproducción' : 'Cargando');
     $('plMsgProg').hidden = progress == null;
     if (progress != null) $('plMsgProg').firstElementChild.style.width = progress + '%';
     pl.classList.add('busy');
@@ -1074,7 +1060,7 @@
 
   // Vuelve a leer carpetas y datos, y redibuja la pantalla actual (los ids de las URL son estables).
   async function refreshAll() {
-    info.textContent = 'Leyendo carpetas…';
+    info.textContent = '';
     try { await Promise.all([loadLibrary(), loadUser()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
     pollConversion();
@@ -1251,7 +1237,7 @@
 
   function notFound() {
     go('/', { replace: true });
-    info.textContent = 'No se encontró el contenido de ese enlace.';
+    reportLog('Enlace sin contenido: ' + location.pathname);
   }
 
   function route() {
