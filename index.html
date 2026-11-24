@@ -84,6 +84,8 @@
 <!-- Iconos del reproductor -->
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <symbol id="i-warn" viewBox="0 0 24 24"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></symbol>
+  <symbol id="i-audio" viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0 0 14.07 6H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></symbol>
   <symbol id="i-back" viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></symbol>
@@ -129,6 +131,7 @@
   </div>
 
   <div class="pl-bottom">
+    <div id="plAudioMenu" class="pl-menu" role="menu" aria-label="Pistas de audio" hidden></div>
     <div class="pl-seekrow">
       <span id="plCur" class="pl-time">0:00</span>
       <input id="plSeek" class="pl-range pl-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Progreso del video">
@@ -140,6 +143,7 @@
       </button>
       <input id="plVol" class="pl-range pl-vol" type="range" min="0" max="100" value="100" step="1" aria-label="Volumen">
       <span class="grow"></span>
+      <button id="plAudio" class="plb sm" type="button" aria-label="Idioma y audio" title="Idioma y audio (A)" aria-haspopup="menu" aria-expanded="false" hidden><svg class="ic"><use href="#i-audio"/></svg></button>
       <button id="plFs" class="plb sm" type="button" aria-label="Pantalla completa" title="Pantalla completa (F)">
         <svg class="ic i-fs"><use href="#i-fs"/></svg><svg class="ic i-fsx"><use href="#i-fsx"/></svg>
       </button>
@@ -203,6 +207,7 @@
   </div>
 </dialog>
 
+<script src="/js/vendor/hls.min.js"></script>
 <script src="/js/app.js"></script>
 </body>
 </html>

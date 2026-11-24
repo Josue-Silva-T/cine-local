@@ -27,17 +27,18 @@
     ArrowLeft: 'left', ArrowRight: 'right', ArrowUp: 'up', ArrowDown: 'down', Enter: 'ok',
     Escape: 'back', Backspace: 'back', BrowserBack: 'back', GoBack: 'back', XF86Back: 'back',
     MediaPlayPause: 'playpause', MediaPlay: 'play', MediaPause: 'pause', MediaStop: 'stop',
-    MediaRewind: 'rew', MediaFastForward: 'ffwd', MediaTrackNext: 'next', MediaTrackPrevious: 'prev'
+    MediaRewind: 'rew', MediaFastForward: 'ffwd', MediaTrackNext: 'next', MediaTrackPrevious: 'prev',
+    MediaAudioTrack: 'audio', ColorF2Yellow: 'audio'                  // tecla «pista de audio» (Android TV) / botón amarillo
   };
   const CODEMAP = {
     37: 'left', 38: 'up', 39: 'right', 40: 'down', 13: 'ok', 8: 'back', 27: 'back',
     10009: 'back', 461: 'back',                                   // Tizen y webOS: «Atrás»
     179: 'playpause', 10252: 'playpause', 415: 'play', 19: 'pause', 413: 'stop',
-    412: 'rew', 417: 'ffwd', 10232: 'prev', 10233: 'next', 176: 'next', 177: 'prev'
+    412: 'rew', 417: 'ffwd', 10232: 'prev', 10233: 'next', 176: 'next', 177: 'prev', 405: 'audio'
   };
   const remoteKey = e => KEYMAP[e.key] || CODEMAP[e.keyCode] || null;
   try {   // Tizen exige registrar las teclas multimedia
-    if (window.tizen && window.tizen.tvinputdevice) ['MediaPlayPause', 'MediaPlay', 'MediaPause', 'MediaStop', 'MediaRewind', 'MediaFastForward', 'MediaTrackPrevious', 'MediaTrackNext']
+    if (window.tizen && window.tizen.tvinputdevice) ['MediaPlayPause', 'MediaPlay', 'MediaPause', 'MediaStop', 'MediaRewind', 'MediaFastForward', 'MediaTrackPrevious', 'MediaTrackNext', 'ColorF2Yellow']
       .forEach(k => { try { window.tizen.tvinputdevice.registerKey(k); } catch {} });
   } catch {}
 
@@ -255,7 +256,6 @@
     info.textContent = '';
     try { await Promise.all([loadUser(), loadLibrary()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
-    pollConversion();
     const target = state.pending || '/';          // si llegó por un enlace directo, se abre ese contenido
     state.pending = null;
     const kind = parseRoute(...(u => [u.pathname, u.search])(new URL(target, location.origin))).name;
@@ -398,17 +398,6 @@
   }
 
   /* ---------- conversión en segundo plano ---------- */
-  // La conversión se informa en la consola del servidor. Aquí solo se detecta que hubo reemplazos para recargar la lista.
-  let convTimer = 0, lastReplaced = null;
-  async function pollConversion() {
-    clearTimeout(convTimer);
-    let c;
-    try { c = await api('/api/conversion'); } catch { return; }
-    if (lastReplaced === null) lastReplaced = c.replaced;
-    if (c.active) convTimer = setTimeout(pollConversion, 3000);
-    else if (c.replaced !== lastReplaced && !playerOpen()) { lastReplaced = c.replaced; refreshAll(); }   // los archivos cambiaron de nombre
-  }
-
   /* ---------- vistas ---------- */
   const setTabs = () => document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === state.tab));
   function showHome() {
@@ -755,7 +744,7 @@
     if (!player.paused && !msgVisible()) idleTimer = setTimeout(hideControls, 3000);
   }
   function hideControls() {
-    if (player.paused || dragging || msgVisible()) return;
+    if (player.paused || dragging || msgVisible() || menuOpen()) return;
     pl.classList.remove('show'); pl.classList.add('idle');
   }
   function showMsg(text, { error = false, progress = null } = {}) {
@@ -891,6 +880,7 @@
   pl.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') showControls(); });
 
   /* --- reproducir un elemento de la lista --- */
+  // Pide al servidor la fuente: HLS (/hls/…/master.m3u8) o, si no es posible, el archivo directo.
   async function resolvePlayable(entry, my) {
     const url = `/api/play?kind=${entry.kind}&root=${entry.root}&path=${encodeURIComponent(entry.rel)}`;
     for (;;) {
@@ -899,13 +889,180 @@
       catch { throw new Error('No se pudo conectar con el servidor.'); }
       if (my !== token) return null;
       if (!r.ok) throw new Error(data.error || 'Error ' + r.status);
-      if (data.note === 'sin-ffmpeg') state.noFfmpeg = true;
-      if (data.state === 'ready') return data.url;
-      const p = Math.round((data.progress || 0) * 100);
-      showMsg(`Optimizando el video para reproducirlo… ${p}%`, { progress: p });
-      await sleep(1000);
+      if (data.note) reportLog('Reproducción directa (' + data.note + ')');
+      if (data.state === 'ready') return data;
+      showMsg('Preparando el video…');                // el servidor está analizando el archivo
+      await sleep(800);
     }
   }
+
+  /* ---------- motor de reproducción: HLS con hls.js (o nativo) y pistas de audio ---------- */
+  let hlsInst = null, engine = null, audioList = [], hlsErr = { net: 0, media: 0, audio: false, warns: 0 }, nativeBound = null;
+  const NATIVE_HLS = !!document.createElement('video').canPlayType('application/vnd.apple.mpegurl');
+  const NATIVE_AUDIO_API = 'audioTracks' in HTMLMediaElement.prototype;
+  // hls.js en casi todos los navegadores; HLS nativo solo cuando permite elegir audio (Safari) o no hay otra opción.
+  const useHlsJs = () => !!(window.Hls && window.Hls.isSupported()) && !(NATIVE_HLS && NATIVE_AUDIO_API);
+  const audioPref = () => { try { return JSON.parse(localStorage.getItem('cl:audio')) || null; } catch { return null; } };
+  const saveAudioPref = t => { try { localStorage.setItem('cl:audio', JSON.stringify({ lang: t.lang, name: t.name })); } catch {} };
+
+  const audioBtn = $('plAudio'), audioMenu = $('plAudioMenu');
+  const menuOpen = () => !audioMenu.hidden;
+
+  function setAudioList(list) {
+    audioList = list;
+    audioBtn.hidden = list.length < 2;               // con una sola pista no hay nada que elegir
+    audioMenu.innerHTML = '';
+    list.forEach(t => {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'pl-opt'; b.setAttribute('role', 'menuitemradio'); b.setAttribute('aria-checked', String(t.active));
+      b.innerHTML = '<svg class="ck"><use href="#i-check"/></svg><span class="tx"><b></b><small></small></span>';
+      b.querySelector('b').textContent = t.name;
+      b.querySelector('small').textContent = t.desc || '';
+      b.dataset.id = t.id;
+      b.onclick = () => selectAudio(t.id);
+      audioMenu.append(b);
+    });
+    if (list.length < 2) closeAudioMenu();
+  }
+  // El servidor produce el audio bajo demanda: al abrir el menú se precalientan las otras pistas cerca de la posición actual.
+  function warmAudio() {
+    const m = hlsInst && hlsInst.url ? /\/hls\/([0-9a-f]{16})\//.exec(hlsInst.url) : null;
+    if (!m || engine !== 'hls.js') return;
+    const idx = Math.max(0, Math.floor(player.currentTime / 6));
+    audioList.filter(t => !t.active).forEach(t => fetch(`/hls/${m[1]}/warm/a${t.id}/${idx}`, { cache: 'no-store' }).catch(() => {}));
+  }
+  function openAudioMenu() {
+    if (audioBtn.hidden) return;
+    warmAudio();
+    audioMenu.hidden = false; audioBtn.setAttribute('aria-expanded', 'true'); pl.classList.add('menu-open');
+    showControls();
+    focusEl(audioMenu.querySelector('[aria-checked="true"]') || audioMenu.firstElementChild);
+  }
+  function closeAudioMenu(refocus) {
+    if (audioMenu.hidden) return;
+    audioMenu.hidden = true; audioBtn.setAttribute('aria-expanded', 'false'); pl.classList.remove('menu-open');
+    if (refocus) focusEl(audioBtn);
+  }
+  audioBtn.onclick = () => (menuOpen() ? closeAudioMenu(true) : openAudioMenu());
+  pl.addEventListener('pointerdown', e => { if (menuOpen() && !audioMenu.contains(e.target) && !audioBtn.contains(e.target)) closeAudioMenu(); }, true);
+
+  // Lee las pistas del manifiesto (#EXT-X-MEDIA: idioma, nombre y atributos X-…) o de la API nativa.
+  function refreshAudio() {
+    if (engine === 'hls.js' && hlsInst) {
+      const attrOf = (t, k) => (t.attrs && t.attrs[k]) || '';
+      setAudioList(hlsInst.audioTracks.map(t => ({
+        id: t.id, name: t.name || ('Pista ' + (t.id + 1)), lang: t.lang || '', desc: attrOf(t, 'X-DESCRIPTION'),
+        original: attrOf(t, 'X-ORIGINAL') === 'YES', active: t.id === hlsInst.audioTrack
+      })));
+    } else if (engine === 'native' && player.audioTracks) {
+      const out = [];
+      for (let i = 0; i < player.audioTracks.length; i++) { const t = player.audioTracks[i]; out.push({ id: i, name: t.label || t.language || ('Pista ' + (i + 1)), lang: t.language || '', desc: '', original: false, active: t.enabled }); }
+      setAudioList(out);
+    }
+  }
+
+  // Cambia de pista sin detener ni reiniciar: la posición se conserva.
+  function selectAudio(id) {
+    const t = audioList.find(x => x.id === id);
+    if (!t) return;
+    if (engine === 'hls.js' && hlsInst) hlsInst.audioTrack = id;
+    else if (engine === 'native' && player.audioTracks) for (let i = 0; i < player.audioTracks.length; i++) player.audioTracks[i].enabled = i === id;
+    saveAudioPref(t);
+    refreshAudio();
+    closeAudioMenu(true);
+  }
+
+  // Al empezar, se prefiere la pista que el usuario eligió la última vez (mismo nombre o mismo idioma).
+  function applyAudioPref() {
+    const pref = audioPref();
+    if (!pref || audioList.length < 2) return;
+    const t = audioList.find(x => x.name === pref.name) || audioList.find(x => x.lang && x.lang === pref.lang);
+    if (t && !t.active) { if (engine === 'hls.js') hlsInst.audioTrack = t.id; else selectAudio(t.id); refreshAudio(); }
+  }
+
+  function nativeUnbind() { if (nativeBound && player.audioTracks) { player.audioTracks.removeEventListener('addtrack', nativeBound); player.audioTracks.removeEventListener('change', nativeBound); } nativeBound = null; }
+
+  function destroyEngine() {
+    if (hlsInst) { try { hlsInst.destroy(); } catch {} hlsInst = null; }
+    nativeUnbind();
+    closeAudioMenu();
+    engine = null;
+    setAudioList([]);
+  }
+
+  function resumeWhenReady(resumeAt) {
+    player.onloadedmetadata = () => { if (resumeAt && resumeAt < player.duration - 5) player.currentTime = resumeAt; onTime(); };
+  }
+
+  function attachSource(info, resumeAt, my) {
+    hlsErr = { net: 0, media: 0, audio: false, warns: 0 };
+    player.onloadedmetadata = null;
+    const go = () => player.play().catch(() => showControls());
+    if (info.mode === 'hls' && useHlsJs()) { engine = 'hls.js'; startHlsJs(info, resumeAt, my); return; }
+    if (info.mode === 'hls' && NATIVE_HLS) {                       // Safari / iOS: HLS nativo
+      engine = 'native';
+      if (player.audioTracks) { nativeBound = refreshAudio; player.audioTracks.addEventListener('addtrack', nativeBound); player.audioTracks.addEventListener('change', nativeBound); }
+      resumeWhenReady(resumeAt); player.src = info.url; go();
+      return;
+    }
+    engine = 'direct';                                              // sin ffmpeg o sin soporte HLS: el archivo tal cual
+    if (info.mode === 'hls') reportLog('El navegador no soporta HLS; se reproduce el archivo directo');
+    resumeWhenReady(resumeAt); player.src = info.mode === 'hls' ? info.direct : info.url; go();
+  }
+
+  function startHlsJs(info, resumeAt, my) {
+    const retry = { maxNumRetry: 3, retryDelayMs: 600, maxRetryDelayMs: 5000 };
+    const hls = new window.Hls({
+      startPosition: resumeAt || -1,
+      maxBufferLength: 30, maxMaxBufferLength: 30, maxBufferSize: 40 * 1000 * 1000, backBufferLength: 20,   // solo se pide lo necesario por delante; no se acumula lo ya visto
+      enableWorker: true, lowLatencyMode: false,
+      // El servidor produce cada segmento bajo demanda: se espera más antes de dar un segmento por perdido.
+      fragLoadPolicy: { default: { maxTimeToFirstByteMs: 120000, maxLoadTimeMs: 180000, timeoutRetry: retry, errorRetry: retry } },
+      manifestLoadPolicy: { default: { maxTimeToFirstByteMs: 30000, maxLoadTimeMs: 60000, timeoutRetry: retry, errorRetry: retry } },
+      playlistLoadPolicy: { default: { maxTimeToFirstByteMs: 30000, maxLoadTimeMs: 60000, timeoutRetry: retry, errorRetry: retry } }
+    });
+    hlsInst = hls;
+    let prefDone = false;
+    hls.on(window.Hls.Events.AUDIO_TRACKS_UPDATED, () => { refreshAudio(); if (!prefDone && audioList.length) { prefDone = true; applyAudioPref(); } });
+    hls.on(window.Hls.Events.AUDIO_TRACK_SWITCHED, refreshAudio);
+    hls.on(window.Hls.Events.MANIFEST_PARSED, () => { if (my === token) player.play().catch(() => showControls()); });
+    hls.on(window.Hls.Events.ERROR, (_, d) => onHlsError(d, info, resumeAt, my));
+    hls.attachMedia(player);
+    hls.loadSource(info.url);
+  }
+
+  // Errores de streaming: reintentos y recuperación; si HLS no se puede salvar, se prueba el archivo directo.
+  function onHlsError(d, info, resumeAt, my) {
+    if (my !== token || !hlsInst) return;
+    const hls = hlsInst, E = window.Hls.ErrorTypes;
+    const tag = `${d.type}/${d.details}${d.frag ? ' ' + d.frag.type + ' #' + d.frag.sn : ''}${d.response && d.response.code ? ' HTTP ' + d.response.code : ''}`;
+    if (!d.fatal) { if (hlsErr.warns++ < 6) reportLog('HLS aviso: ' + tag + (d.reason ? ' · ' + d.reason : '') + (d.error && d.error.message ? ' · ' + d.error.message : '')); return; }
+    reportLog('HLS error: ' + tag);
+    const audioFault = /audioTrack/i.test(d.details) || (d.frag && d.frag.type === 'audio');
+    if (audioFault && !hlsErr.audio) {               // pista de audio que no carga: se vuelve a la predeterminada sin detener la película
+      hlsErr.audio = true;
+      const bad = hls.audioTrack, fallback = hls.audioTracks.find(t => t.id !== bad && (t.default || t.id === 0)) || hls.audioTracks.find(t => t.id !== bad);
+      if (fallback) {
+        reportLog(`Pista de audio ${bad} no disponible; se usa ${fallback.name}`);
+        try { localStorage.removeItem('cl:audio'); } catch {}                    // no recordar una pista que falla
+        hls.audioTrack = fallback.id; hls.startLoad(player.currentTime); refreshAudio();
+        return;
+      }
+    }
+    // Un fallo fatal de manifiesto/lista ya agotó los reintentos de hls.js: no hay nada que reintentar. Los de segmentos, sí.
+    const listFault = /manifest|level|playlist/i.test(d.details);
+    if (d.type === E.NETWORK_ERROR && !listFault && hlsErr.net++ < 2) { hls.startLoad(player.currentTime || -1); return; }
+    if (d.type === E.MEDIA_ERROR && hlsErr.media < 3) { if (hlsErr.media++ === 1) hls.swapAudioCodec(); hls.recoverMediaError(); return; }
+    // HLS no se pudo recuperar
+    const t = player.currentTime;
+    destroyEngine();
+    if (info.direct) {
+      reportLog('HLS no disponible; se intenta reproducir el archivo directo');
+      engine = 'direct'; resumeWhenReady(resumeAt || (t > 5 ? t : null)); player.src = info.direct; player.play().catch(() => showControls());
+    } else showMsg('No se pudo reproducir mediante HLS', { error: true });
+  }
+
+  window.__cine = { hls: () => hlsInst, engine: () => engine, audio: () => audioList };   // para depurar desde la consola del navegador
 
   function updateNav() {
     $('plPrev').disabled = current <= 0;
@@ -941,14 +1098,13 @@
     const p = getProg(it.entry);
     const resumeAt = p && p.t > 5 ? p.t : null;      // reanuda desde el último segundo guardado
 
-    let url;
-    try { url = await resolvePlayable(it.entry, my); }
+    destroyEngine();                                 // suelta el video anterior (y sus pistas de audio)
+    let src;
+    try { src = await resolvePlayable(it.entry, my); }
     catch (e) { if (my === token) showMsg(e.message, { error: true }); return; }
-    if (my !== token || !url) return;
+    if (my !== token || !src) return;
     hideMsg();
-    player.src = url;
-    player.onloadedmetadata = () => { if (resumeAt && resumeAt < player.duration - 5) player.currentTime = resumeAt; onTime(); };
-    player.play().catch(() => showControls());
+    attachSource(src, resumeAt, my);
   }
 
   let saveTick = 0;
@@ -974,10 +1130,8 @@
     else closePlayer();
   });
   player.addEventListener('error', () => {
-    if (!player.getAttribute('src')) return;
-    showMsg(state.noFfmpeg
-      ? 'El navegador no puede reproducir este formato. Instala ffmpeg (sudo apt install ffmpeg) para convertirlo automáticamente.'
-      : 'El navegador no pudo reproducir este archivo.', { error: true });
+    if (!player.getAttribute('src') || engine === 'hls.js') return;      // con hls.js, la recuperación la decide onHlsError
+    showMsg('El navegador no pudo reproducir este archivo.', { error: true });
   });
 
   // Último guardado antes de cerrar la pestaña, minimizar o cambiar de aplicación.
@@ -991,6 +1145,7 @@
     token++;
     clearTimeout(idleTimer);
     if (current >= 0 && player.getAttribute('src') && !player.ended) recordProgress(playlist[current].entry);
+    destroyEngine();
     player.pause(); player.removeAttribute('src'); player.load();
     hideMsg();
     pl.hidden = true; pl.classList.remove('show', 'idle');
@@ -1005,7 +1160,6 @@
     const back = () => { const t = lastFocus && document.contains(lastFocus) && lastFocus.getClientRects().length ? lastFocus : $('resume'); focusEl(t); };
     back();
     setTimeout(() => { if (!playerOpen() && (!document.activeElement || document.activeElement === document.body)) back(); }, 150);
-    pollConversion();
   }
 
   // «Volver»: retrocede en el historial del navegador; en un enlace directo, va a la ficha del contenido.
@@ -1026,7 +1180,17 @@
     const onCtl = pl.contains(ae) && ae.matches('button, input[type=range]');
     const visible = pl.classList.contains('show') && !msgVisible();
     let handled = true;
-    if (IS_TV && (rk === 'left' || rk === 'right' || rk === 'up' || rk === 'down')) {
+    if (menuOpen()) {                                  // menú de idioma abierto: la cruceta/flechas se mueven por las opciones
+      if (rk === 'back' || rk === 'audio' || k === 'a' || k === 'A') closeAudioMenu(true);
+      else if (rk === 'left' || rk === 'right' || rk === 'up' || rk === 'down') move(rk === 'left' ? 'up' : rk === 'right' ? 'down' : rk);
+      else if (rk === 'ok' && ae && ae.classList && ae.classList.contains('pl-opt')) handled = false;   // OK elige la opción enfocada
+      else if (rk === 'ok') handled = false;
+      else handled = false;
+      if (handled) e.preventDefault(); else showControls();
+      return;
+    }
+    if (k === 'a' || k === 'A' || rk === 'audio') { if (!audioBtn.hidden) openAudioMenu(); else handled = false; }
+    else if (IS_TV && (rk === 'left' || rk === 'right' || rk === 'up' || rk === 'down')) {
       if (!visible || !onCtl) {                         // controles ocultos: ←/→ saltan 10 s, ↑/↓ los muestran
         if (rk === 'left') skip(-10); else if (rk === 'right') skip(10);
         else { showControls(); focusEl($('plPlay')); }
@@ -1063,7 +1227,6 @@
     info.textContent = '';
     try { await Promise.all([loadLibrary(), loadUser()]); mergeLocalProgress(); }
     catch (e) { info.textContent = e.message; return; }
-    pollConversion();
     state.view = ''; state.movie = null; state.series = null;
     route();
   }
@@ -1093,7 +1256,7 @@
   const shown = el => !el.closest('[hidden]') && el.getClientRects().length;
 
   function navItems() {
-    if (playerOpen()) return [...pl.querySelectorAll('button, input[type=range]')].filter(el => !el.disabled && shown(el));
+    if (playerOpen()) return [...pl.querySelectorAll(menuOpen() ? '#plAudioMenu button' : 'button, input[type=range]')].filter(el => !el.disabled && shown(el));
     const modal = MODALS.find(d => d.open);
     if (modal) return [...modal.querySelectorAll('button, textarea, input:not([type=file])')].filter(shown);
     if (!profilesEl.hidden) return [...profilesEl.querySelectorAll('button')].filter(shown);

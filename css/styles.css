@@ -366,8 +366,27 @@ html.tv .plb.sm{--sz:60px}
 html.tv .plb.md{--sz:60px}
 html.tv .plnav{height:56px;font-size:1.1rem}
 html.tv .pl-range{height:40px}
-html.tv .pl-vol{display:block}
+html.tv .pl-vol{display:none}                 /* en la TV el volumen se regula con el mando */
 
 /* ---------- Estado del reproductor sin texto: solo indicador de carga o icono de error ---------- */
 .pl-warn-ic{display:none;width:84px;height:84px;color:#ffb4bf}
 .pl-msg.error .pl-warn-ic{display:block}
+
+/* ---------- Menú de idioma / audio ---------- */
+.pl-menu{position:absolute;right:calc(20px + env(safe-area-inset-right));bottom:calc(74px + env(safe-area-inset-bottom));z-index:6;
+  min-width:min(320px,86vw);max-width:min(420px,92vw);max-height:min(60vh,420px);overflow-y:auto;padding:8px;
+  background:rgba(20,16,28,.96);border:1px solid rgba(255,255,255,.14);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.6)}
+.pl-menu[hidden]{display:none}
+.pl-opt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:transparent;border:0;border-radius:10px;
+  padding:12px 14px;color:#fff;font:inherit;cursor:pointer;transition:background .12s}
+.pl-opt:hover{background:rgba(255,255,255,.12)}
+.pl-opt .ck{width:22px;height:22px;flex:none;color:var(--accent);visibility:hidden}
+.pl-opt[aria-checked="true"] .ck{visibility:visible}
+.pl-opt .tx{display:grid;gap:2px;min-width:0}
+.pl-opt .tx b{font-weight:600;font-size:1rem}
+.pl-opt .tx small{color:rgba(255,255,255,.68);font-size:.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pl-opt .tx small:empty{display:none}
+body.kbd .pl-opt:focus{outline:3px solid var(--accent);outline-offset:-3px;background:rgba(255,255,255,.14)}
+html.tv .pl-opt{padding:16px 18px}
+html.tv .pl-opt .tx b{font-size:1.15rem}
+@media (max-height:480px){ .pl-menu{bottom:calc(56px + env(safe-area-inset-bottom));max-height:70vh} }

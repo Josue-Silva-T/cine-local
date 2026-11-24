@@ -23,6 +23,7 @@ const os = require('os');
 const crypto = require('crypto');
 const { exec, execFile, spawn } = require('child_process');
 const { optimizar: optimizarCaratulas } = require('./optimizar-caratulas.js');
+const createHls = require('./hls.js');
 
 const ROOT = __dirname;
 const CONFIG_FILE = path.join(ROOT, 'config.json');
@@ -33,7 +34,7 @@ const NO_OPEN = process.argv.includes('--no-open');
 const VIDEO = /\.(mp4|m4v|webm|mov|mkv|ogv|avi)$/i;
 const IMAGE = /\.(jpe?g|png|webp)$/i;
 const KINDS = ['peliculas', 'series', 'caratulas'];
-const DEFAULTS = { puerto: 3000, claveAdmin: 'admin', nombre: 'Cine local', logo: './logo.svg', convertirVideos: true, reemplazarOriginal: true, reemplazarConPistasExtra: false, optimizarCaratulas: true, peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
+const DEFAULTS = { puerto: 3000, claveAdmin: 'admin', nombre: 'Cine local', logo: './logo.svg', analizarEnSegundoPlano: true, optimizarCaratulas: true, peliculas: ['./peliculas'], series: ['./series'], caratulas: ['./caratulas'] };
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -51,6 +52,18 @@ const ffmpegReady = new Promise(resolve => {
     execFile('nice', ['-n', '10', 'true'], err => { NICE = !err; resolve(); });
   });
 });
+
+// HLS bajo demanda (ver hls.js). Los mensajes se imprimen aquí, no en la página.
+const hls = createHls({ cacheDir: CACHE_DIR, hasFfmpeg: () => FFMPEG, nice: () => NICE, log: msg => console.log('  ' + msg) });
+
+// Restos de versiones anteriores: copias MP4 completas en .cache (ya no se usan).
+(function cleanOldCache() {
+  try {
+    let n = 0;
+    for (const f of fs.readdirSync(CACHE_DIR)) if (/^[0-9a-f]{24}\.mp4(\.part)?$/.test(f) || f === 'probe.json') { fs.unlinkSync(path.join(CACHE_DIR, f)); n++; }
+    if (n) console.log(`  Se eliminaron ${n} archivo(s) de la caché MP4 anterior (ahora se usa HLS bajo demanda).`);
+  } catch {}
+})();
 
 const natural = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 const visible = n => !n.startsWith('.') && !n.startsWith('$');
@@ -84,9 +97,7 @@ function loadConfig() {
     claveAdmin: typeof user.claveAdmin === 'string' ? user.claveAdmin : DEFAULTS.claveAdmin,
     nombre: typeof user.nombre === 'string' && user.nombre.trim() ? user.nombre.trim().slice(0, 40) : DEFAULTS.nombre,
     logo: typeof user.logo === 'string' && user.logo.trim() ? user.logo.trim() : DEFAULTS.logo,
-    convertirVideos: user.convertirVideos !== false,
-    reemplazarOriginal: user.reemplazarOriginal !== false,
-    reemplazarConPistasExtra: user.reemplazarConPistasExtra === true,
+    analizarEnSegundoPlano: user.analizarEnSegundoPlano !== false,
     optimizarCaratulas: user.optimizarCaratulas !== false
   };
   for (const k of KINDS) {
@@ -307,285 +318,34 @@ function serveFile(req, res, abs, cacheable) {
   });
 }
 
-/* ---------- Conversión automática a MP4 (H.264 + AAC) ----------
-   - Los videos compatibles con el navegador se sirven tal cual.
-   - Los demás (MKV, AVI, MOV, HEVC, audio AC3/DTS…) se convierten a .mp4: el video se copia si ya es
-     H.264 y solo se recodifica cuando hace falta; el audio pasa a AAC.
-   - Con "reemplazarOriginal" (por defecto) el .mp4 sustituye al archivo original, MISMO nombre y carpeta.
-     Antes de borrar nada se verifica la copia, y las calificaciones/historial pasan a la nueva ruta.
-   - Un proceso en segundo plano convierte toda la biblioteca; al reproducir, ese video pasa al frente.
-*/
-const CACHE_VERSION = 'v2';
-const PROBE_FILE = path.join(CACHE_DIR, 'probe.json');
-const jobs = new Map();            // id -> { state, phase, progress, error, abs, out, name, decision, bg, replaced }
-const bgQueue = [];                // trabajos en cola (segundo plano)
-const probeQueue = [];             // archivos por analizar
-const stats = { total: 0, done: 0, failed: 0, replaced: 0 };
-const replacedMap = new Map();     // "tipo|raíz|ruta vieja" -> { url nueva }
-const replaceNotes = [];           // motivos por los que un original NO se reemplazó
-let bgRunning = 0, probing = false, probeCache = null, probeTimer = null;
-
-const cacheId = (abs, st) => crypto.createHash('sha1').update([abs, st.size, Math.round(st.mtimeMs), CACHE_VERSION].join('|')).digest('hex').slice(0, 24);
-const cachedPath = id => path.join(CACHE_DIR, id + '.mp4');
-
-function noteReplace(msg) {
-  if (replaceNotes.includes(msg)) return;
-  replaceNotes.push(msg);
-  if (replaceNotes.length > 20) replaceNotes.shift();
-  console.log('  Aviso: ' + msg);
-}
-
-function loadProbeCache() {
-  if (probeCache) return probeCache;
-  try { probeCache = JSON.parse(fs.readFileSync(PROBE_FILE, 'utf8')); } catch { probeCache = {}; }
-  try { for (const f of fs.readdirSync(CACHE_DIR)) if (f.endsWith('.part')) fs.unlinkSync(path.join(CACHE_DIR, f)); } catch {}
-  return probeCache;
-}
-function saveProbeSoon() {
-  if (probeTimer) return;
-  probeTimer = setTimeout(() => {
-    probeTimer = null;
-    try { fs.mkdirSync(CACHE_DIR, { recursive: true }); fs.writeFileSync(PROBE_FILE, JSON.stringify(probeCache)); } catch {}
-  }, 1000);
-}
-
-function ffprobe(abs) {
-  return new Promise(resolve => execFile('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_streams', '-show_format', abs],
-    { maxBuffer: 8e6, timeout: 60000 }, (e, out) => {
-      if (e) return resolve(null);
-      try {
-        const j = JSON.parse(out), streams = j.streams || [];
-        const v = streams.find(s => s.codec_type === 'video' && !(s.disposition && s.disposition.attached_pic));
-        const a = streams.find(s => s.codec_type === 'audio');
-        resolve({
-          duration: parseFloat(j.format && j.format.duration) || 0,
-          video: v ? { codec: v.codec_name, pix_fmt: v.pix_fmt } : null,
-          audio: a ? { codec: a.codec_name, channels: a.channels || 2 } : null,
-          audioTracks: streams.filter(s => s.codec_type === 'audio').length,
-          subtitleTracks: streams.filter(s => s.codec_type === 'subtitle').length
-        });
-      } catch { resolve(null); }
-    }));
-}
-
-// ¿Lo reproduce cualquier navegador tal cual? Si no, cómo convertirlo.
-function decide(info, abs) {
-  const v = info.video, a = info.audio;
-  if (!v) return { convert: false };
-  const ext = path.extname(abs).toLowerCase();
-  const h264Ok = v.codec === 'h264' && v.pix_fmt === 'yuv420p';
-  const audioOk = !a || a.codec === 'aac' || a.codec === 'mp3';
-  if ((ext === '.mp4' || ext === '.m4v') && h264Ok && audioOk) return { convert: false };
-  if (ext === '.webm' && ['vp8', 'vp9', 'av1'].includes(v.codec) && (!a || ['opus', 'vorbis'].includes(a.codec))) return { convert: false };
-  return { convert: true, copyVideo: h264Ok, copyAudio: !!a && a.codec === 'aac' };
-}
-
-function buildArgs(job, part) {
-  const d = job.decision;
-  return ['-y', '-v', 'error', '-nostats', '-progress', 'pipe:1', '-fflags', '+genpts', '-i', job.abs,
-    '-map', '0:v:0', '-map', '0:a:0?', '-sn', '-dn', '-map_chapters', '-1',
-    ...(d.copyVideo
-      ? ['-c:v', 'copy', '-avoid_negative_ts', 'make_zero']
-      : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21', '-pix_fmt', 'yuv420p', '-profile:v', 'high']),
-    ...(d.copyAudio
-      ? ['-c:a', 'copy']
-      : ['-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-af', 'aresample=async=1:first_pts=0']),
-    '-movflags', '+faststart', '-f', 'mp4', part];
-}
-
-/* Reemplaza el original por el .mp4 convertido (mismo nombre y carpeta). Nunca lanza errores:
-   si algo no cuadra, el original se conserva y se sigue usando la copia de .cache. */
-async function postProcess(job) {
-  try {
-    if (!loadConfig().cfg.reemplazarOriginal) return;
-    const cfg = loadConfig().cfg;
-    const src = job.abs, ext = path.extname(src), dir = path.dirname(src), base = path.basename(src, ext);
-    const dst = path.join(dir, base + '.mp4');
-    const skip = why => noteReplace(`No se reemplazó "${path.basename(src)}": ${why}. Se usa la copia convertida de .cache.`);
-
-    const st = await fs.promises.stat(src).catch(() => null);
-    if (!st || st.size !== job.size) return skip('el archivo cambió mientras se convertía');
-    const si = await ffprobe(src);
-    if (!si) return skip('no se pudo analizar el original');
-    if (!cfg.reemplazarConPistasExtra && (si.audioTracks > 1 || si.subtitleTracks > 0))
-      return skip(`tiene ${si.audioTracks} pistas de audio y ${si.subtitleTracks} de subtítulos que se perderían`);
-    const oi = await ffprobe(job.out);
-    if (!oi || !oi.video || oi.video.codec !== 'h264') return skip('la copia convertida no es válida');
-    if (si.audio && !(oi.audio && oi.audio.codec === 'aac')) return skip('la copia convertida no tiene audio');
-    if (si.duration && Math.abs(oi.duration - si.duration) > Math.max(2, si.duration * 0.01)) return skip('la duración de la copia no coincide');
-    if (dst !== src && fs.existsSync(dst)) return skip(`ya existe "${path.basename(dst)}" en esa carpeta`);
-
-    const tmp = path.join(dir, `.${base}.cine-${process.pid}.tmp`);
-    try {
-      await fs.promises.copyFile(job.out, tmp);                              // el destino puede estar en otro disco
-      const [a, b] = await Promise.all([fs.promises.stat(tmp), fs.promises.stat(job.out)]);
-      if (a.size !== b.size) throw new Error('la copia quedó incompleta');
-      await fs.promises.rename(tmp, dst);                                    // atómico (si dst === src, sustituye al original)
-      if (dst !== src) {
-        try { await fs.promises.unlink(src); }
-        catch (e) { await fs.promises.unlink(dst).catch(() => {}); throw e; }  // sin poder borrar el original: se deshace
-      }
-    } catch (e) {
-      await fs.promises.unlink(tmp).catch(() => {});
-      return skip(['EACCES', 'EROFS', 'EPERM'].includes(e.code) ? 'no hay permiso de escritura en esa carpeta' : e.message);
-    }
-    fs.promises.unlink(job.out).catch(() => {});
-
-    const newRel = job.rel.replace(/\.[^./]+$/, '') + '.mp4';
-    const nst = await fs.promises.stat(dst);
-    migrateKey(entryKey(job.kind, job.rel, job.size), entryKey(job.kind, newRel, nst.size));
-    job.replaced = { url: mediaUrl(job.kind, job.root, newRel) };
-    replacedMap.set(`${job.kind}|${job.root}|${job.rel}`, job.replaced);
-    stats.replaced++;
-    console.log(`  Video reemplazado: ${path.basename(src)} → ${path.basename(dst)}`);
-  } catch (e) {
-    noteReplace(`No se reemplazó "${path.basename(job.abs)}": ${e.message}`);
-  }
-}
-
-const settle = job => {
-  job.phase = 'replacing';
-  return postProcess(job).finally(() => { job.state = 'ready'; job.progress = 1; if (!job.finalizing) stats.done++; });
-};
-
-function startJob(job) {
-  job.state = 'working'; job.phase = 'converting';
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
-  const part = job.out + '.part';
-  const args = buildArgs(job, part);
-  const ff = job.bg && NICE ? spawn('nice', ['-n', '10', 'ffmpeg', ...args]) : spawn('ffmpeg', args);
-  console.log(`  Convirtiendo "${job.name}"${job.bg ? ' (segundo plano)' : ''}…`);
-  let errText = '', finished = false;
-  const finish = (ok, error) => {
-    if (finished) return;
-    finished = true;
-    if (job.bg) bgRunning--;
-    if (!ok) { job.state = 'error'; job.error = error; stats.failed++; fs.unlink(part, () => {}); console.log(`  Error al convertir "${job.name}": ${error}`); if (job.bg) pumpBg(); return; }
-    console.log(`  Convertido: "${job.name}"`);
-    job.progress = 0.99;
-    if (job.bg) pumpBg();
-    settle(job);
-  };
-  ff.stdout.on('data', d => {
-    const line = d.toString().split('\n').reverse().find(l => l.startsWith('out_time_us=') || l.startsWith('out_time_ms=')) || '';
-    const m = /=(\d+)/.exec(line);
-    if (m && job.duration) job.progress = Math.min(parseInt(m[1], 10) / 1e6 / job.duration, 0.98);
-    const step = Math.floor(job.progress * 5);
-    if (step > (job.logStep || 0)) { job.logStep = step; console.log(`  Convirtiendo "${job.name}": ${step * 20} %`); }
-  });
-  ff.stderr.on('data', d => { errText += d.toString(); });
-  ff.on('error', e => finish(false, e.message));
-  ff.on('close', code => {
-    if (code === 0) fs.rename(part, job.out, e => finish(!e, e && e.message));
-    else finish(false, errText.trim().split('\n').pop() || `ffmpeg salió con código ${code}`);
-  });
-}
-
-function pumpBg() {
-  if (bgRunning > 0) return;
-  const job = bgQueue.shift();
-  if (!job) return;
-  bgRunning++;
-  startJob(job);
-}
-
-function makeJob(id, abs, info, bg, meta) {
-  const job = { id, state: 'queued', phase: 'queued', progress: 0, error: null, abs, out: cachedPath(id), name: path.basename(abs),
-    decision: info.decision, duration: info.duration || 0, bg, ...meta };
-  jobs.set(id, job);
-  stats.total++;
-  return job;
-}
-
-// Ya existe la copia en .cache (conversión anterior): solo falta sustituir el original.
-function finalizeJob(id, abs, meta) {
-  const job = { id, state: 'working', phase: 'replacing', progress: 0.99, error: null, abs, out: cachedPath(id), name: path.basename(abs), bg: false, finalizing: true, ...meta };
-  jobs.set(id, job);
-  return job;
-}
-
-async function infoFor(abs, id) {
-  const cache = loadProbeCache();
-  if (cache[id]) return cache[id];
-  const raw = await ffprobe(abs);
-  if (!raw) return null;
-  cache[id] = { ...raw, decision: decide(raw, abs) };
-  saveProbeSoon();
-  return cache[id];
-}
-
-// Segundo plano: analiza la biblioteca y encola lo que haga falta convertir.
-async function enqueueLibrary(lib) {
-  await ffmpegReady;
-  if (!FFMPEG || !loadConfig().cfg.convertirVideos) return;
-  const entries = [...lib.movies.map(m => m.entry), ...lib.series.flatMap(s => s.seasons.flatMap(se => se.episodes.map(e => e.entry)))];
-  probeQueue.push(...entries);
-  if (probing) return;
-  probing = true;
-  try {
-    while (probeQueue.length) {
-      const e = probeQueue.shift();
-      const abs = resolveMedia(e.kind, e.root, e.rel);
-      if (!abs) continue;
-      const st = await fs.promises.stat(abs).catch(() => null);
-      if (!st) continue;
-      const id = cacheId(abs, st);
-      if (jobs.has(id)) continue;
-      const meta = { kind: e.kind, root: e.root, rel: e.rel, size: st.size };
-      if (fs.existsSync(cachedPath(id))) {
-        if (loadConfig().cfg.reemplazarOriginal) await settle(finalizeJob(id, abs, meta));
-        continue;
-      }
-      const info = await infoFor(abs, id);
-      if (info && info.decision.convert) { bgQueue.push(makeJob(id, abs, info, true, meta)); pumpBg(); }
-    }
-  } finally { probing = false; }
-}
-
-// Al reproducir: devuelve la URL lista, o el avance si todavía se está convirtiendo.
+/* ---------- Reproducción: HLS bajo demanda ---------- */
 async function playable(kind, idx, rel) {
   const abs = resolveMedia(kind, idx, rel);
   if (!abs || !VIDEO.test(abs)) return [400, { error: 'ruta no válida' }];
-  const moved = replacedMap.get(`${kind}|${idx}|${rel}`);                    // el original ya fue sustituido por el .mp4
-  if (moved && !fs.existsSync(abs)) return [200, { state: 'ready', url: moved.url, converted: true }];
   const st = await fs.promises.stat(abs).catch(() => null);
   if (!st || !st.isFile()) return [404, { error: 'no encontrado' }];
-  const direct = { state: 'ready', url: mediaUrl(kind, idx, rel), converted: false };
   await ffmpegReady;
+  const direct = { state: 'ready', mode: 'direct', url: mediaUrl(kind, idx, rel) };   // respaldo si HLS no es posible
   if (!FFMPEG) return [200, { ...direct, note: 'sin-ffmpeg' }];
-
-  const id = cacheId(abs, st);
-  const meta = { kind, root: idx, rel, size: st.size };
-  let job = jobs.get(id);
-  if (!job && fs.existsSync(cachedPath(id))) {
-    if (!loadConfig().cfg.reemplazarOriginal) return [200, { state: 'ready', url: '/cache/' + id + '.mp4', converted: true }];
-    job = finalizeJob(id, abs, meta);
-    settle(job);
-  }
-  if (!job) {
-    const info = await infoFor(abs, id);
-    if (!info || !info.decision.convert) return [200, direct];
-    job = makeJob(id, abs, info, false, meta);
-    startJob(job);
-  } else if (job.state === 'queued') {                       // estaba en cola: pasa al frente
-    const i = bgQueue.indexOf(job);
-    if (i >= 0) bgQueue.splice(i, 1);
-    job.bg = false;
-    startJob(job);
-  }
-  if (job.state === 'error') return [200, { ...direct, warning: job.error }];   // intenta el original
-  if (job.state === 'ready') return [200, { state: 'ready', url: job.replaced ? job.replaced.url : '/cache/' + id + '.mp4', converted: true }];
-  return [200, { state: 'working', progress: job.progress, phase: job.phase }];
+  const r = hls.prepare(abs, st);
+  if (r.state === 'working') return [200, { state: 'working' }];
+  if (r.state === 'error') return [200, { ...direct, note: r.error }];
+  return [200, { state: 'ready', mode: 'hls', url: `/hls/${r.sid}/master.m3u8`, direct: direct.url }];
 }
 
-function conversionStatus() {
-  const working = [...jobs.values()].filter(j => j.state === 'working');
-  const cur = working[0];
-  return {
-    active: probing || bgQueue.length > 0 || working.length > 0,
-    total: stats.total, done: stats.done, failed: stats.failed, replaced: stats.replaced, pending: bgQueue.length,
-    current: cur ? { name: cur.name, progress: cur.progress, phase: cur.phase } : null
-  };
+// Analiza en segundo plano las películas (una a la vez) para que el primer play empiece al instante.
+function warmHls(lib) {
+  if (!loadConfig().cfg.analizarEnSegundoPlano) return;
+  ffmpegReady.then(async () => {
+    const items = [];
+    const entries = [...lib.movies.map(m => m.entry), ...lib.series.flatMap(s => s.seasons.flatMap(se => se.episodes.map(e => e.entry)))];
+    for (const e of entries) {
+      const abs = resolveMedia(e.kind, e.root, e.rel);
+      const st = abs && await fs.promises.stat(abs).catch(() => null);
+      if (st) items.push({ abs, st });
+    }
+    hls.warm(items);
+  }).catch(() => {});
 }
 
 /* ---------- Servidor ---------- */
@@ -598,7 +358,7 @@ function logoPath() {
 
 const STATIC = {
   '/': 'index.html', '/index.html': 'index.html',
-  '/css/styles.css': 'css/styles.css', '/js/app.js': 'js/app.js'
+  '/css/styles.css': 'css/styles.css', '/js/app.js': 'js/app.js', '/js/vendor/hls.min.js': 'js/vendor/hls.min.js'
 };
 const json = (res, code, body) => {
   res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -633,27 +393,7 @@ function saveNow() {
   } catch (e) { console.error('No se pudo guardar data/db.json:', e.message); }
 }
 const scheduleSave = () => { if (!saveTimer) saveTimer = setTimeout(saveNow, 400); };
-['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => { saveNow(); process.exit(0); }));
-
-const keyAlias = new Map();    // clave vieja -> clave nueva (tras reemplazar un video)
-const K = k => { let x = k; for (let i = 0; i < 3 && keyAlias.has(x); i++) x = keyAlias.get(x); return x; };
-
-// El video cambió de ruta/tamaño: calificaciones e historial pasan a la clave nueva.
-function migrateKey(oldKey, newKey) {
-  if (oldKey === newKey) return;
-  keyAlias.set(oldKey, newKey);
-  for (const h of Object.values(db.history)) {
-    if (!h[oldKey]) continue;
-    const cur = h[newKey];
-    h[newKey] = cur && cur.at > h[oldKey].at ? { ...cur, pct: Math.max(cur.pct || 0, h[oldKey].pct || 0) } : h[oldKey];
-    delete h[oldKey];
-  }
-  if (db.ratings[oldKey]) {
-    db.ratings[newKey] = Object.assign({}, db.ratings[oldKey], db.ratings[newKey] || {});
-    delete db.ratings[oldKey];
-  }
-  saveNow();
-}
+['SIGINT', 'SIGTERM'].forEach(sig => process.on(sig, () => { saveNow(); hls.shutdown().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); }));
 
 const publicProfile = p => ({ id: p.id, name: p.name, avatar: p.avatar ? `/avatars/${p.avatar}` : null });
 const findProfile = id => db.profiles.find(p => p.id === id);
@@ -772,7 +512,6 @@ async function profileApi(req, res, p, url) {
 
   if (p === '/api/history' && m === 'POST') {
     const b = await readBody(req, 1e5);
-    if (typeof b.key === 'string') b.key = K(b.key);
     if (!findProfile(b.profile) || typeof b.key !== 'string' || !b.key || b.key.length > 400) return fail(400, 'Datos no válidos');
     if (!db.history[b.profile]) db.history[b.profile] = {};
     const prev = db.history[b.profile][b.key];
@@ -793,7 +532,7 @@ async function profileApi(req, res, p, url) {
 
   if (p === '/api/reviews' && m === 'POST') {
     const b = await readBody(req, 5e5);
-    const keys = (Array.isArray(b.keys) ? b.keys.slice(0, 1000) : []).map(K);
+    const keys = Array.isArray(b.keys) ? b.keys.slice(0, 1000) : [];
     const out = [];
     for (const key of keys) {
       const byProfile = db.ratings[key];
@@ -811,7 +550,6 @@ async function profileApi(req, res, p, url) {
 
   if (p === '/api/rating' && m === 'POST') {
     const b = await readBody(req, 1e5);
-    if (typeof b.key === 'string') b.key = K(b.key);
     const stars = Number(b.stars);
     if (!findProfile(b.profile) || typeof b.key !== 'string' || !b.key || b.key.length > 400) return fail(400, 'Datos no válidos');
     if (!Number.isInteger(stars) || stars < 1 || stars > 5) return fail(400, 'Elige de 1 a 5 estrellas');
@@ -824,7 +562,6 @@ async function profileApi(req, res, p, url) {
 
   if (p === '/api/rating/delete' && m === 'POST') {
     const b = await readBody(req, 1e5);
-    if (typeof b.key === 'string') b.key = K(b.key);
     if (db.ratings[b.key]) {
       delete db.ratings[b.key][b.profile];
       if (!Object.keys(db.ratings[b.key]).length) delete db.ratings[b.key];
@@ -843,7 +580,7 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/library') {
       const lib = await scan();
-      enqueueLibrary(lib).catch(() => {});
+      warmHls(lib);
       return json(res, 200, lib);
     }
 
@@ -862,7 +599,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, code, body);
     }
 
-    if (p === '/api/conversion') return json(res, 200, conversionStatus());
+    if (p.startsWith('/hls/') && await hls.handle(req, res, p)) return;
 
     if (p === '/api/branding') return json(res, 200, { name: loadConfig().cfg.nombre, logo: '/logo' });
     if (p === '/logo') return serveFile(req, res, logoPath(), false);
@@ -874,7 +611,6 @@ const server = http.createServer(async (req, res) => {
       return serveFile(req, res, abs, true);
     }
 
-    if (/^\/cache\/[a-f0-9]{24}\.mp4$/.test(p)) return serveFile(req, res, path.join(CACHE_DIR, p.slice(7)), true);
 
     if (STATIC[p]) return serveFile(req, res, path.join(ROOT, STATIC[p]), false);
     // Rutas de la interfaz (/movie/…, /show/…, /watch…): siempre devuelven la misma página
@@ -911,7 +647,7 @@ server.listen(PORT, LAN ? '0.0.0.0' : '127.0.0.1', () => {
   if (cfg.claveAdmin === 'admin') console.log('  Aviso: la contraseña de administrador sigue siendo "admin". Cámbiala en config.json (claveAdmin).');
   else if (!cfg.claveAdmin) console.log('  Aviso: sin contraseña de administrador (claveAdmin vacía): no se podrán eliminar perfiles.');
   console.log('\n  Rutas editables en config.json. Ctrl + C para detener.\n');
-  scan().then(enqueueLibrary).catch(e => console.error('Escaneo inicial:', e.message));
+  scan().then(warmHls).catch(e => console.error('Escaneo inicial:', e.message));
   if (!NO_OPEN) {
     const cmd = process.platform === 'darwin' ? `open "${local}"` : `xdg-open "${local}"`;
     exec(cmd, () => {});

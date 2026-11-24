@@ -3,11 +3,15 @@
   "claveAdmin": "admin",
   "nombre": "Cine local",
   "logo": "./logo.svg",
-  "convertirVideos": true,
-  "reemplazarOriginal": true,
-  "reemplazarConPistasExtra": false,
+  "analizarEnSegundoPlano": true,
   "optimizarCaratulas": true,
-  "peliculas": ["./peliculas"],
-  "series": ["./series"],
-  "caratulas": ["./caratulas"]
+  "peliculas": [
+    "./peliculas"
+  ],
+  "series": [
+    "./series"
+  ],
+  "caratulas": [
+    "./caratulas"
+  ]
 }
